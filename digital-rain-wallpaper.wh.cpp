@@ -2,7 +2,7 @@
 // @id              digital-rain-wallpaper
 // @name            Digital Rain Wallpaper
 // @description     Plays a digital rain animation as the desktop background, rendered with Direct3D 11 behind the desktop icons
-// @version         0.1.0
+// @version         0.2.0
 // @author          radiocity
 // @github          https://github.com/radiocity
 // @license         GPL-3.0
@@ -29,6 +29,7 @@ animation spans all monitors.
 - Simple style with a single sharp rain layer.
 - Pauses while windows cover every monitor, while the session is locked and,
   optionally, on battery power.
+- Optional FPS counter in any corner of the primary monitor.
 
 ## Settings
 
@@ -39,6 +40,10 @@ animation spans all monitors.
 - **Style:** layered (original look) or simple.
 - **Font:** font used for the characters. Characters the font can't draw are
   skipped. The default, MS Gothic, covers the whole set.
+- **Show FPS counter:** shows the frames presented per second, in the rain
+  color and the size of the front rain layer.
+- **FPS counter position:** top left, top right, bottom left or bottom right
+  of the primary monitor's work area.
 
 ## Credits
 
@@ -78,6 +83,17 @@ This mod is licensed under GPL-3.0.
   $description: Pause while maximized or fullscreen windows cover every monitor.
 - pauseOnBattery: false
   $name: Pause on battery power
+- showFps: false
+  $name: Show FPS counter
+  $description: Shows the frames presented per second, in the rain color and character size.
+- fpsPosition: topRight
+  $name: FPS counter position
+  $description: Corner of the primary monitor's work area, so the taskbar doesn't hide the counter.
+  $options:
+  - topLeft: Top left
+  - topRight: Top right
+  - bottomLeft: Bottom left
+  - bottomRight: Bottom right
 */
 // ==/WindhawkModSettings==
 // clang-format on
@@ -213,6 +229,8 @@ constexpr double kMaxIdleMs = 1000.0;
 constexpr double kTransitionFrameMs = 16.0;
 // Steps due within this time run now, to merge nearly coinciding frames.
 constexpr double kEarlyStepMs = 1.0;
+constexpr double kFpsWindowMs = 1000.0;
+constexpr float kFpsBackdropAlpha = 0.6f;
 
 // Undocumented Progman message that creates the WorkerW window behind the
 // desktop icons.
@@ -320,6 +338,8 @@ struct RenderTexture {
   int height = 0;
 };
 
+enum class FpsPosition { kTopLeft, kTopRight, kBottomLeft, kBottomRight };
+
 struct Settings {
   Color color = {0.0f, 1.0f, 0.0f, 1.0f};
   float speed = 1.0f;
@@ -328,6 +348,8 @@ struct Settings {
   std::wstring font_name = kDefaultFontName;
   bool pause_when_covered = true;
   bool pause_on_battery = false;
+  bool show_fps = false;
+  FpsPosition fps_position = FpsPosition::kTopRight;
 };
 
 enum class FrameResult { kIdle, kPresented, kDeviceLost };
@@ -411,6 +433,17 @@ Settings LoadSettings() {
 
   settings.pause_when_covered = Wh_GetIntSetting(L"pauseWhenCovered") != 0;
   settings.pause_on_battery = Wh_GetIntSetting(L"pauseOnBattery") != 0;
+  settings.show_fps = Wh_GetIntSetting(L"showFps") != 0;
+
+  PCWSTR fps_position = Wh_GetStringSetting(L"fpsPosition");
+  if (wcscmp(fps_position, L"topLeft") == 0) {
+    settings.fps_position = FpsPosition::kTopLeft;
+  } else if (wcscmp(fps_position, L"bottomLeft") == 0) {
+    settings.fps_position = FpsPosition::kBottomLeft;
+  } else if (wcscmp(fps_position, L"bottomRight") == 0) {
+    settings.fps_position = FpsPosition::kBottomRight;
+  }
+  Wh_FreeStringSetting(fps_position);
   return settings;
 }
 
@@ -471,6 +504,16 @@ class GlyphAtlas {
   int glyph_count() const { return glyph_count_; }
   ID3D11ShaderResourceView* view() const { return view_.Get(); }
 
+  // Returns the glyph of a character, or -1 if the atlas doesn't have it.
+  int FindGlyph(wchar_t character) const;
+  float AdvancePx(int glyph, float font_px) const {
+    return advances_[glyph] * font_px / kAtlasEm;
+  }
+  float AscentPx(float font_px) const { return ascent_ * font_px / kAtlasEm; }
+  float DescentPx(float font_px) const {
+    return descent_ * font_px / kAtlasEm;
+  }
+
   // Places a glyph like canvas fillText(): x is the left edge and baseline
   // the alphabetic baseline, in pixels.
   GlyphInstance MakeGlyph(int glyph, float x, float baseline, float font_px,
@@ -481,9 +524,12 @@ class GlyphAtlas {
  private:
   ComPtr<ID3D11ShaderResourceView> view_;
   int glyph_count_ = 0;
+  std::wstring characters_;
+  std::vector<float> advances_;  // Atlas pixels.
   float cell_width_ = 0.0f;
   float cell_height_ = 0.0f;
   float ascent_ = 0.0f;
+  float descent_ = 0.0f;
   float texture_width_ = 1.0f;
   float texture_height_ = 1.0f;
 };
@@ -517,6 +563,16 @@ bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
     }
   }
   if (glyphs.empty()) glyphs = candidates;
+
+  std::vector<float> advances;
+  advances.reserve(glyphs.size());
+  for (wchar_t character : glyphs) {
+    INT advance = 0;
+    if (!GetCharWidth32W(dc, character, character, &advance)) {
+      advance = kAtlasEm / 2;
+    }
+    advances.push_back(static_cast<float>(advance));
+  }
 
   const int cell_width = kAtlasEm + 2 * kAtlasPadding;
   const int cell_height = metrics.tmHeight + 2 * kAtlasPadding;
@@ -596,14 +652,22 @@ bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
 
   view_ = view;
   glyph_count_ = static_cast<int>(glyphs.size());
+  characters_ = glyphs;
+  advances_ = std::move(advances);
   cell_width_ = static_cast<float>(cell_width);
   cell_height_ = static_cast<float>(cell_height);
   ascent_ = static_cast<float>(metrics.tmAscent);
+  descent_ = static_cast<float>(metrics.tmDescent);
   texture_width_ = static_cast<float>(width);
   texture_height_ = static_cast<float>(height);
   Wh_Log(L"Glyph atlas: font \"%s\", %d of %d characters, %dx%d", face_name,
          glyph_count_, static_cast<int>(candidates.size()), width, height);
   return true;
+}
+
+int GlyphAtlas::FindGlyph(wchar_t character) const {
+  const size_t index = characters_.find(character);
+  return index == std::wstring::npos ? -1 : static_cast<int>(index);
 }
 
 GlyphInstance GlyphAtlas::MakeGlyph(int glyph, float x, float baseline,
@@ -651,6 +715,10 @@ class RainRenderer {
   bool Resize(int width, int height, float dpi_scale, double now_ms);
   bool ApplySettings(const Settings& settings, double now_ms);
 
+  // Area the FPS counter is placed in, in window pixels. Resize() resets it
+  // to the whole window.
+  void SetCounterArea(const RECT& area) { counter_area_ = area; }
+
   // Restarts the frame clocks, so a long pause doesn't cause a burst of
   // catch-up steps.
   void Resume(double now_ms);
@@ -683,6 +751,9 @@ class RainRenderer {
   void StepLayer(RainLayer& layer);
   void BlinkOverlay();
   void Composite(double now_ms);
+  void CompositeOverlay(double now_ms);
+  void DrawFpsCounter();
+  void CountPresentedFrame(double now_ms);
   void Blur(ID3D11ShaderResourceView* source);
 
   void SetTarget(ID3D11RenderTargetView* target, int width, int height);
@@ -734,6 +805,11 @@ class RainRenderer {
   double next_blur_toggle_ms_ = 0.0;
   float presented_blur_amount_ = -1.0f;
 
+  RECT counter_area_ = {};
+  int fps_ = -1;  // -1 until the first measurement.
+  int fps_frames_ = 0;
+  double fps_window_start_ms_ = 0.0;
+
   std::mt19937 random_engine_{std::random_device{}()};
   std::uniform_real_distribution<float> distribution_{0.0f, 1.0f};
 };
@@ -750,6 +826,7 @@ bool RainRenderer::Initialize(HWND window, int width, int height,
   height_ = height;
   dpi_scale_ = dpi_scale;
   settings_ = settings;
+  counter_area_ = {0, 0, width_, height_};
   return CreateDevice() &&
          atlas_.Build(device_.Get(), context_.Get(), settings_.font_name) &&
          CreateTargets() && ResetAnimation(now_ms);
@@ -929,6 +1006,7 @@ bool RainRenderer::Resize(int width, int height, float dpi_scale,
   width_ = width;
   height_ = height;
   dpi_scale_ = dpi_scale;
+  counter_area_ = {0, 0, width_, height_};
 
   // ResizeBuffers needs every reference to the old buffers released.
   layers_.clear();
@@ -989,6 +1067,8 @@ bool RainRenderer::ResetAnimation(double now_ms) {
   blur_toggle_ms_ = now_ms - kBlurTransitionMs;
   next_blur_toggle_ms_ = now_ms + kOverlayBlurToggleMs;
   presented_blur_amount_ = -1.0f;
+  fps_frames_ = 0;
+  fps_window_start_ms_ = now_ms;
   return true;
 }
 
@@ -1016,6 +1096,8 @@ void RainRenderer::Resume(double now_ms) {
   }
   last_blink_ms_ = now_ms - kOverlayBlinkMs;
   next_blur_toggle_ms_ = now_ms + kOverlayBlurToggleMs;
+  fps_frames_ = 0;
+  fps_window_start_ms_ = now_ms;
 }
 
 FrameResult RainRenderer::Advance(double now_ms) {
@@ -1052,7 +1134,17 @@ FrameResult RainRenderer::Advance(double now_ms) {
            static_cast<unsigned long>(result));
     return FrameResult::kDeviceLost;
   }
+  CountPresentedFrame(now_ms);
   return FrameResult::kPresented;
+}
+
+void RainRenderer::CountPresentedFrame(double now_ms) {
+  ++fps_frames_;
+  const double elapsed_ms = now_ms - fps_window_start_ms_;
+  if (elapsed_ms < kFpsWindowMs) return;
+  fps_ = static_cast<int>(fps_frames_ * 1000.0 / elapsed_ms + 0.5);
+  fps_frames_ = 0;
+  fps_window_start_ms_ = now_ms;
 }
 
 double RainRenderer::NextFrameMs(double now_ms) const {
@@ -1139,8 +1231,11 @@ void RainRenderer::Composite(double now_ms) {
                    premultiplied_blend_.Get());
   }
 
-  if (!settings_.layered) return;
+  if (settings_.layered) CompositeOverlay(now_ms);
+  DrawFpsCounter();
+}
 
+void RainRenderer::CompositeOverlay(double now_ms) {
   // The overlay's blur fades in and out, so the sharp and the blurred
   // versions are cross-faded.
   const float blur_amount = BlurAmount(now_ms);
@@ -1160,6 +1255,56 @@ void RainRenderer::Composite(double now_ms) {
                    premultiplied_blend_.Get());
   }
   presented_blur_amount_ = blur_amount;
+}
+
+// Draws "FPS: <n>" with the glyphs, color and size of the front rain layer,
+// on a translucent backdrop that keeps it readable over the rain.
+void RainRenderer::DrawFpsCounter() {
+  if (!settings_.show_fps || layers_.empty()) return;
+  const float font_px = layers_.front().font_px;
+  const std::wstring text =
+      L"FPS: " + (fps_ < 0 ? std::wstring(L"--") : std::to_wstring(fps_));
+
+  // Characters missing from the atlas, like the space, only advance.
+  const float missing_advance = 0.5f * font_px;
+  float text_width = 0.0f;
+  for (wchar_t character : text) {
+    const int glyph = atlas_.FindGlyph(character);
+    text_width +=
+        glyph < 0 ? missing_advance : atlas_.AdvancePx(glyph, font_px);
+  }
+  const float ascent = atlas_.AscentPx(font_px);
+  const float text_height = ascent + atlas_.DescentPx(font_px);
+
+  const float margin = font_px;
+  const float padding = 0.5f * font_px;
+  const bool right = settings_.fps_position == FpsPosition::kTopRight ||
+                     settings_.fps_position == FpsPosition::kBottomRight;
+  const bool bottom = settings_.fps_position == FpsPosition::kBottomLeft ||
+                      settings_.fps_position == FpsPosition::kBottomRight;
+  const float left = right ? counter_area_.right - margin - text_width
+                           : counter_area_.left + margin;
+  const float top = bottom ? counter_area_.bottom - margin - text_height
+                           : counter_area_.top + margin;
+
+  glyphs_.clear();
+  glyphs_.push_back(atlas_.MakeSolid(
+      left - padding, top - padding, text_width + 2.0f * padding,
+      text_height + 2.0f * padding, {0.0f, 0.0f, 0.0f, kFpsBackdropAlpha}));
+  float x = left;
+  for (wchar_t character : text) {
+    const int glyph = atlas_.FindGlyph(character);
+    if (glyph < 0) {
+      x += missing_advance;
+      continue;
+    }
+    glyphs_.push_back(
+        atlas_.MakeGlyph(glyph, x, top + ascent, font_px, settings_.color));
+    x += atlas_.AdvancePx(glyph, font_px);
+  }
+
+  SetTarget(back_buffer_.Get(), width_, height_);
+  DrawGlyphs(glyphs_, straight_blend_.Get());
 }
 
 // Separable Gaussian blur into blur_vertical_.
@@ -1413,6 +1558,7 @@ class DesktopWallpaper {
   void UpdatePauseState();
   SIZE HostSize() const;
   float DpiScale() const;
+  RECT CounterArea() const;
 
   HWND host_ = nullptr;
   HWND window_ = nullptr;
@@ -1597,6 +1743,7 @@ bool DesktopWallpaper::CreateRenderer() {
     return false;
   }
   renderer_ = std::move(renderer);
+  renderer_->SetCounterArea(CounterArea());
   return true;
 }
 
@@ -1652,20 +1799,24 @@ void DesktopWallpaper::CheckHost() {
 
   const SIZE size = HostSize();
   const float dpi_scale = DpiScale();
-  if (size.cx == width_ && size.cy == height_ && dpi_scale == dpi_scale_) {
-    return;
+  const bool resized = size.cx != width_ || size.cy != height_ ||
+                       dpi_scale != dpi_scale_;
+  if (resized) {
+    width_ = size.cx;
+    height_ = size.cy;
+    dpi_scale_ = dpi_scale;
+    Wh_Log(L"Resizing to %dx%d, DPI scale %.2f", width_, height_,
+           dpi_scale_);
+    SetWindowPos(window_, nullptr, 0, 0, width_, height_,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    if (renderer_ &&
+        !renderer_->Resize(width_, height_, dpi_scale_, NowMs())) {
+      renderer_.reset();
+    }
   }
-  width_ = size.cx;
-  height_ = size.cy;
-  dpi_scale_ = dpi_scale;
-  Wh_Log(L"Resizing to %dx%d, DPI scale %.2f", width_, height_, dpi_scale_);
-  SetWindowPos(window_, nullptr, 0, 0, width_, height_,
-               SWP_NOZORDER | SWP_NOACTIVATE);
-  if (renderer_ &&
-      !renderer_->Resize(width_, height_, dpi_scale_, NowMs())) {
-    renderer_.reset();
-  }
-  if (!paused_) ScheduleFrame(0.0);
+  // The taskbar can move or resize the work area at any time.
+  if (renderer_) renderer_->SetCounterArea(CounterArea());
+  if (resized && !paused_) ScheduleFrame(0.0);
 }
 
 void DesktopWallpaper::UpdatePauseState() {
@@ -1695,6 +1846,21 @@ SIZE DesktopWallpaper::HostSize() const {
 float DesktopWallpaper::DpiScale() const {
   const UINT dpi = window_ ? GetDpiForWindow(window_) : 0;
   return dpi ? dpi / 96.0f : 1.0f;
+}
+
+// The primary monitor's work area in window pixels, so the taskbar doesn't
+// hide the FPS counter.
+RECT DesktopWallpaper::CounterArea() const {
+  RECT area = {0, 0, width_, height_};
+  MONITORINFO info = {};
+  info.cbSize = sizeof(info);
+  if (GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY),
+                      &info)) {
+    area = info.rcWork;
+    MapWindowPoints(HWND_DESKTOP, window_, reinterpret_cast<POINT*>(&area),
+                    2);
+  }
+  return area;
 }
 
 DWORD WINAPI RenderThreadProc(void*) {

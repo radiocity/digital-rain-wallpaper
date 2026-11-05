@@ -5,6 +5,13 @@ All notable changes to this mod are documented in this file. Entries follow
 versions follow [Semantic Versioning](https://semver.org/) with the project
 rule from [AGENTS.md](AGENTS.md): breaking changes bump MINOR, never MAJOR.
 
+## [0.2.0] - 2026-11-05
+
+### Features
+
+- fps: add an optional FPS counter in the rain color and character size,
+  placed in a chosen corner of the primary monitor's work area
+
 ## [0.1.0] - 2026-11-05
 
 ### Features

@@ -15,6 +15,7 @@ working. One animation spans all monitors.
   sharp layer.
 - Pauses while windows cover every monitor, while the session is locked and,
   optionally, on battery power.
+- Optional FPS counter in any corner of the primary monitor.
 - Recovers when Explorer recreates the desktop or the graphics device is lost.
 
 ## Install
@@ -39,6 +40,8 @@ Requires Windows 10 or 11 and a Direct3D 10 capable GPU.
 | Font | MS Gothic | Font for the characters. Characters it can't draw are skipped. |
 | Pause when the desktop is covered | On | Pause while maximized or fullscreen windows cover every monitor. |
 | Pause on battery power | Off | Pause while the computer runs on battery. |
+| Show FPS counter | Off | Show the frames presented per second, in the rain color and the size of the front rain layer. |
+| FPS counter position | Top right | Top left, top right, bottom left or bottom right of the primary monitor's work area, clear of the taskbar. |
 
 ## How it works
 
