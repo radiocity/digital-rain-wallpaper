@@ -5,6 +5,21 @@ All notable changes to this mod are documented in this file. Entries follow
 versions follow [Semantic Versioning](https://semver.org/) with the project
 rule from [AGENTS.md](AGENTS.md): breaking changes bump MINOR, never MAJOR.
 
+## [0.3.0] - 2026-11-05
+
+### Features
+
+- size: set the character size from 1% to 100% of 72 pt for the largest
+  characters, with the smaller layers in proportion
+- atlas: rasterize the glyph atlas at the drawn size, so large characters
+  stay sharp, and store it in a single channel
+
+### BREAKING CHANGES
+
+- size: the `fontScale` setting (50% to 400% of the original) is replaced by
+  `fontSize`. A saved `fontScale` value is ignored and the size returns to
+  the default 13%, the original size
+
 ## [0.2.0] - 2026-11-05
 
 ### Features

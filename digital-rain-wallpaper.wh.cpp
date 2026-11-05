@@ -2,7 +2,7 @@
 // @id              digital-rain-wallpaper
 // @name            Digital Rain Wallpaper
 // @description     Plays a digital rain animation as the desktop background, rendered with Direct3D 11 behind the desktop icons
-// @version         0.2.0
+// @version         0.3.0
 // @author          radiocity
 // @github          https://github.com/radiocity
 // @license         GPL-3.0
@@ -35,8 +35,9 @@ animation spans all monitors.
 
 - **Rain color:** `#RGB` or `#RRGGBB`, green by default.
 - **Speed:** 25% to 400% of the original speed.
-- **Character size:** 50% to 400% of the original size, scaled further by the
-  display DPI.
+- **Character size:** size of the largest characters, from 1% to 100% of
+  72 pt. Smaller layers keep their proportions. 13% is the original size. The
+  display DPI scales it further.
 - **Style:** layered (original look) or simple.
 - **Font:** font used for the characters. Characters the font can't draw are
   skipped. The default, MS Gothic, covers the whole set.
@@ -67,9 +68,9 @@ This mod is licensed under GPL-3.0.
 - speed: 100
   $name: Speed (%)
   $description: Animation speed relative to the original, from 25 to 400.
-- fontScale: 100
+- fontSize: 13
   $name: Character size (%)
-  $description: Character size relative to the original, from 50 to 400. The display DPI scales it further.
+  $description: Size of the largest characters, from 1 to 100 percent of 72 pt. Smaller layers keep their proportions. 13 is the original size. The display DPI scales it further.
 - style: layered
   $name: Style
   $options:
@@ -211,9 +212,20 @@ constexpr float kBlurRadius = 4.0f;  // CSS pixels.
 // Keeps 3 sigma within the 12-tap kernel radius of PsBlur.
 constexpr float kMaxBlurSigma = 4.0f;
 
-constexpr int kAtlasEm = 48;
-constexpr int kAtlasPadding = 4;
-constexpr int kAtlasColumns = 32;
+// The largest characters at 100% of the size setting: 72 pt is 96 CSS px.
+constexpr float kMaxFontSize = 96.0f;
+constexpr float kLargestFontSize = [] {
+  float largest = kOverlayFontSize;
+  for (const RainLayerConfig& layer : kRainLayers) {
+    largest = std::max(largest, layer.font_size);
+  }
+  return largest;
+}();
+
+// The atlas em follows the largest characters, so big sizes stay sharp.
+constexpr int kMinAtlasEm = 48;
+constexpr int kMaxAtlasEm = 240;
+constexpr int kMaxAtlasWidth = 4096;
 constexpr float kAtlasMaxLod = 3.0f;
 
 constexpr wchar_t kDefaultFontName[] = L"MS Gothic";
@@ -417,8 +429,9 @@ Settings LoadSettings() {
   Wh_FreeStringSetting(color);
 
   settings.speed = std::clamp(Wh_GetIntSetting(L"speed"), 25, 400) / 100.0f;
-  settings.font_scale =
-      std::clamp(Wh_GetIntSetting(L"fontScale"), 50, 400) / 100.0f;
+  // Percent of kMaxFontSize for the largest characters.
+  const int font_size = std::clamp(Wh_GetIntSetting(L"fontSize"), 1, 100);
+  settings.font_scale = font_size / 100.0f * kMaxFontSize / kLargestFontSize;
 
   PCWSTR style = Wh_GetStringSetting(L"style");
   settings.layered = wcscmp(style, L"simple") != 0;
@@ -498,21 +511,22 @@ ComPtr<ID3DBlob> CompileShader(const char* entry_point, const char* target) {
 // Cell 0 is solid white, for drawing filled rectangles.
 class GlyphAtlas {
  public:
+  // Rasterizes the characters with an em of `em` pixels.
   bool Build(ID3D11Device* device, ID3D11DeviceContext* context,
-             const std::wstring& font_name);
+             const std::wstring& font_name, int em);
 
   int glyph_count() const { return glyph_count_; }
+  int em() const { return em_; }
+  const std::wstring& font_name() const { return font_name_; }
   ID3D11ShaderResourceView* view() const { return view_.Get(); }
 
   // Returns the glyph of a character, or -1 if the atlas doesn't have it.
   int FindGlyph(wchar_t character) const;
   float AdvancePx(int glyph, float font_px) const {
-    return advances_[glyph] * font_px / kAtlasEm;
+    return advances_[glyph] * font_px / em_;
   }
-  float AscentPx(float font_px) const { return ascent_ * font_px / kAtlasEm; }
-  float DescentPx(float font_px) const {
-    return descent_ * font_px / kAtlasEm;
-  }
+  float AscentPx(float font_px) const { return ascent_ * font_px / em_; }
+  float DescentPx(float font_px) const { return descent_ * font_px / em_; }
 
   // Places a glyph like canvas fillText(): x is the left edge and baseline
   // the alphabetic baseline, in pixels.
@@ -523,6 +537,10 @@ class GlyphAtlas {
 
  private:
   ComPtr<ID3D11ShaderResourceView> view_;
+  std::wstring font_name_;
+  int em_ = 1;
+  int padding_ = 0;
+  int columns_ = 1;
   int glyph_count_ = 0;
   std::wstring characters_;
   std::vector<float> advances_;  // Atlas pixels.
@@ -535,13 +553,13 @@ class GlyphAtlas {
 };
 
 bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
-                       const std::wstring& font_name) {
+                       const std::wstring& font_name, int em) {
   const std::wstring candidates =
       std::wstring(kLatinCharacters) + kJapaneseCharacters;
 
   HDC dc = CreateCompatibleDC(nullptr);
   if (!dc) return false;
-  HFONT font = CreateFontW(-kAtlasEm, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+  HFONT font = CreateFontW(-em, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                            DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
                            ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN,
                            font_name.c_str());
@@ -569,16 +587,19 @@ bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
   for (wchar_t character : glyphs) {
     INT advance = 0;
     if (!GetCharWidth32W(dc, character, character, &advance)) {
-      advance = kAtlasEm / 2;
+      advance = em / 2;
     }
     advances.push_back(static_cast<float>(advance));
   }
 
-  const int cell_width = kAtlasEm + 2 * kAtlasPadding;
-  const int cell_height = metrics.tmHeight + 2 * kAtlasPadding;
+  // The padding keeps neighboring cells apart down to mip kAtlasMaxLod.
+  const int padding = std::max(4, em / 12);
+  const int cell_width = em + 2 * padding;
+  const int cell_height = metrics.tmHeight + 2 * padding;
+  const int columns = std::min(32, kMaxAtlasWidth / cell_width);
   const int cell_count = static_cast<int>(glyphs.size()) + 1;
-  const int rows = (cell_count + kAtlasColumns - 1) / kAtlasColumns;
-  const int width = kAtlasColumns * cell_width;
+  const int rows = (cell_count + columns - 1) / columns;
+  const int width = columns * cell_width;
   const int height = rows * cell_height;
 
   BITMAPINFO info = {};
@@ -606,19 +627,18 @@ bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
   SetTextAlign(dc, TA_LEFT | TA_TOP | TA_NOUPDATECP);
   for (size_t i = 0; i < glyphs.size(); ++i) {
     const int cell = static_cast<int>(i) + 1;
-    TextOutW(dc, (cell % kAtlasColumns) * cell_width + kAtlasPadding,
-             (cell / kAtlasColumns) * cell_height + kAtlasPadding, &glyphs[i],
-             1);
+    TextOutW(dc, (cell % columns) * cell_width + padding,
+             (cell / columns) * cell_height + padding, &glyphs[i], 1);
   }
   GdiFlush();
 
-  // GDI draws grayscale coverage; every channel of the texture gets it.
-  std::vector<uint32_t> pixels(static_cast<size_t>(width) * height);
+  // GDI draws grayscale coverage, which becomes the single texture channel.
+  std::vector<uint8_t> pixels(static_cast<size_t>(width) * height);
   const uint32_t* source = static_cast<const uint32_t*>(bits);
   for (size_t i = 0; i < pixels.size(); ++i) {
-    uint32_t coverage = std::max({(source[i] >> 16) & 0xFF,
-                                  (source[i] >> 8) & 0xFF, source[i] & 0xFF});
-    pixels[i] = coverage * 0x01010101u;
+    pixels[i] = static_cast<uint8_t>(std::max({(source[i] >> 16) & 0xFF,
+                                               (source[i] >> 8) & 0xFF,
+                                               source[i] & 0xFF}));
   }
 
   SelectObject(dc, old_bitmap);
@@ -632,7 +652,7 @@ bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
   desc.Height = height;
   desc.MipLevels = 0;
   desc.ArraySize = 1;
-  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.Format = DXGI_FORMAT_R8_UNORM;
   desc.SampleDesc.Count = 1;
   desc.Usage = D3D11_USAGE_DEFAULT;
   desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -646,11 +666,15 @@ bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
              L"CreateShaderResourceView")) {
     return false;
   }
-  context->UpdateSubresource(texture.Get(), 0, nullptr, pixels.data(),
-                             width * sizeof(uint32_t), 0);
+  context->UpdateSubresource(texture.Get(), 0, nullptr, pixels.data(), width,
+                             0);
   context->GenerateMips(view.Get());
 
   view_ = view;
+  font_name_ = font_name;
+  em_ = em;
+  padding_ = padding;
+  columns_ = columns;
   glyph_count_ = static_cast<int>(glyphs.size());
   characters_ = glyphs;
   advances_ = std::move(advances);
@@ -660,8 +684,9 @@ bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
   descent_ = static_cast<float>(metrics.tmDescent);
   texture_width_ = static_cast<float>(width);
   texture_height_ = static_cast<float>(height);
-  Wh_Log(L"Glyph atlas: font \"%s\", %d of %d characters, %dx%d", face_name,
-         glyph_count_, static_cast<int>(candidates.size()), width, height);
+  Wh_Log(L"Glyph atlas: font \"%s\", em %d, %d of %d characters, %dx%d",
+         face_name, em_, glyph_count_, static_cast<int>(candidates.size()),
+         width, height);
   return true;
 }
 
@@ -673,14 +698,14 @@ int GlyphAtlas::FindGlyph(wchar_t character) const {
 GlyphInstance GlyphAtlas::MakeGlyph(int glyph, float x, float baseline,
                                     float font_px, const Color& color) const {
   const int cell = glyph + 1;
-  const float scale = font_px / kAtlasEm;
+  const float scale = font_px / em_;
   GlyphInstance instance;
-  instance.x = x - kAtlasPadding * scale;
-  instance.y = baseline - (kAtlasPadding + ascent_) * scale;
+  instance.x = x - padding_ * scale;
+  instance.y = baseline - (padding_ + ascent_) * scale;
   instance.width = cell_width_ * scale;
   instance.height = cell_height_ * scale;
-  instance.u = (cell % kAtlasColumns) * cell_width_ / texture_width_;
-  instance.v = (cell / kAtlasColumns) * cell_height_ / texture_height_;
+  instance.u = (cell % columns_) * cell_width_ / texture_width_;
+  instance.v = (cell / columns_) * cell_height_ / texture_height_;
   instance.uv_width = cell_width_ / texture_width_;
   instance.uv_height = cell_height_ / texture_height_;
   instance.color = color;
@@ -741,6 +766,7 @@ class RainRenderer {
 
   bool CreateDevice();
   void BindSharedState();
+  bool EnsureAtlas();
   bool CreateTargets();
   bool ResetAnimation(double now_ms);
   double StepIntervalMs(const RainLayer& layer) const;
@@ -827,9 +853,20 @@ bool RainRenderer::Initialize(HWND window, int width, int height,
   dpi_scale_ = dpi_scale;
   settings_ = settings;
   counter_area_ = {0, 0, width_, height_};
-  return CreateDevice() &&
-         atlas_.Build(device_.Get(), context_.Get(), settings_.font_name) &&
-         CreateTargets() && ResetAnimation(now_ms);
+  return CreateDevice() && EnsureAtlas() && CreateTargets() &&
+         ResetAnimation(now_ms);
+}
+
+bool RainRenderer::EnsureAtlas() {
+  const int em = std::clamp(
+      static_cast<int>(kLargestFontSize * dpi_scale_ * settings_.font_scale +
+                       0.5f),
+      kMinAtlasEm, kMaxAtlasEm);
+  if (atlas_.view() && atlas_.em() == em &&
+      atlas_.font_name() == settings_.font_name) {
+    return true;
+  }
+  return atlas_.Build(device_.Get(), context_.Get(), settings_.font_name, em);
 }
 
 bool RainRenderer::CreateDevice() {
@@ -1018,20 +1055,15 @@ bool RainRenderer::Resize(int width, int height, float dpi_scale,
     return false;
   }
   BindSharedState();
-  return CreateTargets() && ResetAnimation(now_ms);
+  return EnsureAtlas() && CreateTargets() && ResetAnimation(now_ms);
 }
 
 bool RainRenderer::ApplySettings(const Settings& settings, double now_ms) {
-  const bool font_changed = settings.font_name != settings_.font_name;
-  const bool layout_changed = font_changed ||
+  const bool layout_changed = settings.font_name != settings_.font_name ||
                               settings.layered != settings_.layered ||
                               settings.font_scale != settings_.font_scale;
   settings_ = settings;
-  if (font_changed &&
-      !atlas_.Build(device_.Get(), context_.Get(), settings_.font_name)) {
-    return false;
-  }
-  return !layout_changed || ResetAnimation(now_ms);
+  return EnsureAtlas() && (!layout_changed || ResetAnimation(now_ms));
 }
 
 // Matches the canvas state after a resize: empty canvases and every drop at

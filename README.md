@@ -35,7 +35,7 @@ Requires Windows 10 or 11 and a Direct3D 10 capable GPU.
 | --- | --- | --- |
 | Rain color | `#00FF00` | Color of the falling characters, `#RGB` or `#RRGGBB`. |
 | Speed | 100% | 25% to 400% of the original speed. |
-| Character size | 100% | 50% to 400% of the original size, scaled further by the display DPI. |
+| Character size | 13% | Size of the largest characters, 1% to 100% of 72 pt. Smaller layers keep their proportions. 13% is the original size. The display DPI scales it further. |
 | Style | Layered | `Layered` is the original look. `Simple` keeps one sharp layer. |
 | Font | MS Gothic | Font for the characters. Characters it can't draw are skipped. |
 | Pause when the desktop is covered | On | Pause while maximized or fullscreen windows cover every monitor. |
