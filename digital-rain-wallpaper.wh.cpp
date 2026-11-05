@@ -2,7 +2,7 @@
 // @id              digital-rain-wallpaper
 // @name            Digital Rain Wallpaper
 // @description     Plays a digital rain animation as the desktop background, rendered with Direct3D 11 behind the desktop icons
-// @version         0.3.0
+// @version         0.4.0
 // @author          radiocity
 // @github          https://github.com/radiocity
 // @license         GPL-3.0
@@ -38,6 +38,10 @@ animation spans all monitors.
 - **Character size:** size of the largest characters, from 1% to 100% of
   72 pt. Smaller layers keep their proportions. 13% is the original size. The
   display DPI scales it further.
+- **Frame limit:** maximum frames per second, from 24 up to the highest
+  refresh rate of your monitors, which the animation spans. 0 uses that
+  refresh rate. The rain keeps its speed at any limit. Higher limits make the
+  overlay's blur fades smoother.
 - **Style:** layered (original look) or simple.
 - **Font:** font used for the characters. Characters the font can't draw are
   skipped. The default, MS Gothic, covers the whole set.
@@ -71,6 +75,9 @@ This mod is licensed under GPL-3.0.
 - fontSize: 13
   $name: Character size (%)
   $description: Size of the largest characters, from 1 to 100 percent of 72 pt. Smaller layers keep their proportions. 13 is the original size. The display DPI scales it further.
+- frameLimit: 60
+  $name: Frame limit (FPS)
+  $description: Maximum frames per second, from 24 up to the highest refresh rate of your monitors. 0 uses that refresh rate. The rain keeps its speed at any limit.
 - style: layered
   $name: Style
   $options:
@@ -238,7 +245,10 @@ constexpr UINT kPauseCheckIntervalMs = 500;
 constexpr DWORD kHostWaitIntervalMs = 1000;
 constexpr DWORD kRetryDelayMs = 5000;
 constexpr double kMaxIdleMs = 1000.0;
-constexpr double kTransitionFrameMs = 16.0;
+constexpr int kMinFrameLimit = 24;
+constexpr int kDefaultRefreshRate = 60;
+// Steps a layer may catch up in one frame before it skips ahead instead.
+constexpr int kMaxCatchUpSteps = 4;
 // Steps due within this time run now, to merge nearly coinciding frames.
 constexpr double kEarlyStepMs = 1.0;
 constexpr double kFpsWindowMs = 1000.0;
@@ -355,6 +365,8 @@ enum class FpsPosition { kTopLeft, kTopRight, kBottomLeft, kBottomRight };
 struct Settings {
   Color color = {0.0f, 1.0f, 0.0f, 1.0f};
   float speed = 1.0f;
+  // Requested limit; 0 means the highest monitor refresh rate.
+  int frame_limit = kDefaultRefreshRate;
   float font_scale = 1.0f;
   bool layered = true;
   std::wstring font_name = kDefaultFontName;
@@ -429,6 +441,8 @@ Settings LoadSettings() {
   Wh_FreeStringSetting(color);
 
   settings.speed = std::clamp(Wh_GetIntSetting(L"speed"), 25, 400) / 100.0f;
+  settings.frame_limit = std::max(0, Wh_GetIntSetting(L"frameLimit"));
+
   // Percent of kMaxFontSize for the largest characters.
   const int font_size = std::clamp(Wh_GetIntSetting(L"fontSize"), 1, 100);
   settings.font_scale = font_size / 100.0f * kMaxFontSize / kLargestFontSize;
@@ -744,6 +758,10 @@ class RainRenderer {
   // to the whole window.
   void SetCounterArea(const RECT& area) { counter_area_ = area; }
 
+  // Caps the presented frames per second. The animation keeps its speed:
+  // steps that come due between frames are drawn together.
+  void SetFrameLimit(int fps) { frame_interval_ms_ = 1000.0 / fps; }
+
   // Restarts the frame clocks, so a long pause doesn't cause a burst of
   // catch-up steps.
   void Resume(double now_ms);
@@ -835,6 +853,9 @@ class RainRenderer {
   int fps_ = -1;  // -1 until the first measurement.
   int fps_frames_ = 0;
   double fps_window_start_ms_ = 0.0;
+
+  double frame_interval_ms_ = 1000.0 / kDefaultRefreshRate;
+  double last_present_ms_ = 0.0;
 
   std::mt19937 random_engine_{std::random_device{}()};
   std::uniform_real_distribution<float> distribution_{0.0f, 1.0f};
@@ -1133,14 +1154,23 @@ void RainRenderer::Resume(double now_ms) {
 }
 
 FrameResult RainRenderer::Advance(double now_ms) {
+  if (now_ms + kEarlyStepMs < last_present_ms_ + frame_interval_ms_) {
+    return FrameResult::kIdle;
+  }
+
   bool dirty = false;
   for (RainLayer& layer : layers_) {
     const double interval = StepIntervalMs(layer);
-    if (now_ms + kEarlyStepMs < layer.last_step_ms + interval) continue;
-    StepLayer(layer);
-    layer.last_step_ms += interval;
+    // Below the layer's own rate, one frame draws several steps.
+    for (int step = 0;
+         step < kMaxCatchUpSteps &&
+         now_ms + kEarlyStepMs >= layer.last_step_ms + interval;
+         ++step) {
+      StepLayer(layer);
+      layer.last_step_ms += interval;
+      dirty = true;
+    }
     if (now_ms - layer.last_step_ms > interval) layer.last_step_ms = now_ms;
-    dirty = true;
   }
 
   if (settings_.layered) {
@@ -1166,6 +1196,7 @@ FrameResult RainRenderer::Advance(double now_ms) {
            static_cast<unsigned long>(result));
     return FrameResult::kDeviceLost;
   }
+  last_present_ms_ = now_ms;
   CountPresentedFrame(now_ms);
   return FrameResult::kPresented;
 }
@@ -1187,11 +1218,12 @@ double RainRenderer::NextFrameMs(double now_ms) const {
   if (settings_.layered) {
     next_ms = std::min(
         {next_ms, last_blink_ms_ + kOverlayBlinkMs, next_blur_toggle_ms_});
+    // The blur fade animates at the frame limit.
     if (now_ms - blur_toggle_ms_ < kBlurTransitionMs) {
-      next_ms = std::min(next_ms, now_ms + kTransitionFrameMs);
+      next_ms = std::min(next_ms, now_ms + frame_interval_ms_);
     }
   }
-  return next_ms;
+  return std::max(next_ms, last_present_ms_ + frame_interval_ms_);
 }
 
 // One frame of matrixRain() in the original.
@@ -1559,6 +1591,39 @@ bool IsDesktopCovered() {
   return !monitors.empty() && remaining == 0;
 }
 
+BOOL CALLBACK CollectMonitorRefreshRate(HMONITOR monitor, HDC, LPRECT,
+                                        LPARAM param) {
+  MONITORINFOEXW info = {};
+  info.cbSize = sizeof(info);
+  DEVMODEW mode = {};
+  mode.dmSize = sizeof(mode);
+  if (GetMonitorInfoW(monitor, &info) &&
+      EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) &&
+      mode.dmDisplayFrequency > 1) {
+    int& rate = *reinterpret_cast<int*>(param);
+    rate = std::max(rate, static_cast<int>(mode.dmDisplayFrequency));
+  }
+  return TRUE;
+}
+
+// Returns the highest refresh rate of all monitors, which the animation
+// spans. Values 0 and 1 from EnumDisplaySettings mean the hardware default
+// and are ignored.
+int MaxMonitorRefreshRate() {
+  int rate = 0;
+  EnumDisplayMonitors(nullptr, nullptr, CollectMonitorRefreshRate,
+                      reinterpret_cast<LPARAM>(&rate));
+  return rate > 0 ? rate : kDefaultRefreshRate;
+}
+
+// Resolves the requested frame limit to [kMinFrameLimit, the highest monitor
+// refresh rate].
+int EffectiveFrameLimit(int requested) {
+  const int monitor_max = MaxMonitorRefreshRate();
+  const int limit = requested <= 0 ? monitor_max : requested;
+  return std::max(kMinFrameLimit, std::min(limit, monitor_max));
+}
+
 bool IsOnBattery() {
   SYSTEM_POWER_STATUS status;
   return GetSystemPowerStatus(&status) && status.ACLineStatus == 0;
@@ -1591,6 +1656,7 @@ class DesktopWallpaper {
   SIZE HostSize() const;
   float DpiScale() const;
   RECT CounterArea() const;
+  void ApplyFrameLimit();
 
   HWND host_ = nullptr;
   HWND window_ = nullptr;
@@ -1605,6 +1671,7 @@ class DesktopWallpaper {
   int width_ = 0;
   int height_ = 0;
   float dpi_scale_ = 1.0f;
+  int frame_limit_ = 0;
   Settings settings_;
   std::unique_ptr<RainRenderer> renderer_;
 };
@@ -1776,6 +1843,7 @@ bool DesktopWallpaper::CreateRenderer() {
   }
   renderer_ = std::move(renderer);
   renderer_->SetCounterArea(CounterArea());
+  ApplyFrameLimit();
   return true;
 }
 
@@ -1813,6 +1881,7 @@ void DesktopWallpaper::ReloadSettings() {
   if (renderer_ && !renderer_->ApplySettings(settings_, NowMs())) {
     renderer_.reset();
   }
+  ApplyFrameLimit();
   UpdatePauseState();
   if (!paused_) ScheduleFrame(0.0);
 }
@@ -1846,8 +1915,10 @@ void DesktopWallpaper::CheckHost() {
       renderer_.reset();
     }
   }
-  // The taskbar can move or resize the work area at any time.
+  // The taskbar can move or resize the work area, and monitors can change
+  // their refresh rate, at any time.
   if (renderer_) renderer_->SetCounterArea(CounterArea());
+  ApplyFrameLimit();
   if (resized && !paused_) ScheduleFrame(0.0);
 }
 
@@ -1878,6 +1949,15 @@ SIZE DesktopWallpaper::HostSize() const {
 float DesktopWallpaper::DpiScale() const {
   const UINT dpi = window_ ? GetDpiForWindow(window_) : 0;
   return dpi ? dpi / 96.0f : 1.0f;
+}
+
+void DesktopWallpaper::ApplyFrameLimit() {
+  const int limit = EffectiveFrameLimit(settings_.frame_limit);
+  if (limit != frame_limit_) {
+    Wh_Log(L"Frame limit: %d FPS", limit);
+    frame_limit_ = limit;
+  }
+  if (renderer_) renderer_->SetFrameLimit(limit);
 }
 
 // The primary monitor's work area in window pixels, so the taskbar doesn't

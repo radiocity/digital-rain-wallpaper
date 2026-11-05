@@ -5,6 +5,14 @@ All notable changes to this mod are documented in this file. Entries follow
 versions follow [Semantic Versioning](https://semver.org/) with the project
 rule from [AGENTS.md](AGENTS.md): breaking changes bump MINOR, never MAJOR.
 
+## [0.4.0] - 2026-11-05
+
+### Features
+
+- fps: add a frame limit from 24 FPS up to the highest monitor refresh rate.
+  The rain keeps its speed at any limit, and the overlay's blur fades run at
+  the limit
+
 ## [0.3.0] - 2026-11-05
 
 ### Features
