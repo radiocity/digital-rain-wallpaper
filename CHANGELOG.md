@@ -5,6 +5,16 @@ All notable changes to this mod are documented in this file. Entries follow
 versions follow [Semantic Versioning](https://semver.org/) with the project
 rule from [AGENTS.md](AGENTS.md): breaking changes bump MINOR, never MAJOR.
 
+## [0.9.0] - 2026-11-05
+
+### Features
+
+- seamless: add a seamless animation setting that plays one animation over
+  all monitors as arranged in the Windows display settings, so the rain
+  crosses from one monitor to the next, at the primary monitor's size
+- fps: cap the frame limit at the lowest monitor refresh rate with seamless
+  animation
+
 ## [0.8.1] - 2026-11-05
 
 ### Bug Fixes

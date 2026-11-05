@@ -2,7 +2,7 @@
 // @id              digital-rain-wallpaper
 // @name            Digital Rain Wallpaper
 // @description     Plays a digital rain animation as the desktop background, rendered with Direct3D 11 behind the desktop icons
-// @version         0.8.1
+// @version         0.9.0
 // @author          radiocity
 // @github          https://github.com/radiocity
 // @license         GPL-3.0
@@ -45,9 +45,13 @@ animation spans all monitors.
   size. Characters have the same physical size on every monitor, measured
   from the size the monitor reports, or its display scale if it reports none.
 - **Frame limit:** maximum frames per second, from 24 up to the highest
-  refresh rate of your monitors, which the animation spans. 0 uses that
-  refresh rate. The rain keeps its speed at any limit. Higher limits make the
-  overlay's blur fades smoother.
+  refresh rate of your monitors, or the lowest one with seamless animation.
+  0 uses that refresh rate. The rain keeps its speed at any limit. Higher
+  limits make the overlay's blur fades smoother.
+- **Seamless animation:** plays one animation across all monitors as they
+  are arranged in the Windows display settings, so the rain crosses from one
+  monitor to the next. Characters take the primary monitor's size. Otherwise
+  each monitor plays its own rain, sized to look the same on all of them.
 - **Direction:** the characters fly to the top, left, right or bottom
   (original). The characters stay upright.
 - **Style:** layered (original look) or simple.
@@ -96,7 +100,10 @@ This mod is licensed under GPL-3.0.
   $description: Size of the largest characters, from 1 to 100 percent of 72 pt. Smaller layers keep their proportions. 13 is the original size. Characters have the same physical size on every monitor.
 - frameLimit: 60
   $name: Frame limit (FPS)
-  $description: Maximum frames per second, from 24 up to the highest refresh rate of your monitors. 0 uses that refresh rate. The rain keeps its speed at any limit.
+  $description: Maximum frames per second, from 24 up to the highest refresh rate of your monitors, or the lowest one with seamless animation. 0 uses that refresh rate. The rain keeps its speed at any limit.
+- seamless: false
+  $name: Seamless animation
+  $description: Plays one animation across all monitors as they are arranged in the Windows display settings, so the rain crosses from one monitor to the next. Characters take the primary monitor's size, and the frame limit can't exceed the lowest monitor refresh rate.
 - rssFeeds: ""
   $name: RSS feeds
   $description: RSS or Atom feed links, separated by commas or semicolons, optionally in quotes. The columns spell the feed headlines. Empty plays the original characters.
@@ -438,6 +445,8 @@ struct Settings {
   bool show_fps = false;
   FpsPosition fps_position = FpsPosition::kTopRight;
   Direction direction = Direction::kBottom;
+  // One animation across all monitors instead of one per monitor.
+  bool seamless = false;
 };
 
 // A monitor's part of the window, and its pixels per CSS pixel (1/96 inch),
@@ -445,6 +454,7 @@ struct Settings {
 struct MonitorArea {
   RECT rect;
   float scale;
+  bool primary;
 };
 
 // Headlines read from the feeds, and one message per feed that failed.
@@ -601,6 +611,7 @@ Settings LoadSettings() {
     settings.direction = Direction::kRight;
   }
   Wh_FreeStringSetting(direction);
+  settings.seamless = Wh_GetIntSetting(L"seamless") != 0;
   return settings;
 }
 
@@ -1160,7 +1171,8 @@ bool RainRenderer::SetMonitors(const std::vector<MonitorArea>& monitors,
       monitors.size() == monitors_.size() &&
       std::equal(monitors.begin(), monitors.end(), monitors_.begin(),
                  [](const MonitorArea& a, const MonitorArea& b) {
-                   return EqualRect(&a.rect, &b.rect) && a.scale == b.scale;
+                   return EqualRect(&a.rect, &b.rect) && a.scale == b.scale &&
+                          a.primary == b.primary;
                  });
   if (same) return true;
   monitors_ = monitors;
@@ -1171,13 +1183,24 @@ bool RainRenderer::SetMonitors(const std::vector<MonitorArea>& monitors,
 void RainRenderer::UpdateAreas() {
   const RECT window = {0, 0, width_, height_};
   areas_.clear();
-  for (const MonitorArea& monitor : monitors_) {
-    RECT visible;
-    if (IntersectRect(&visible, &monitor.rect, &window)) {
-      areas_.push_back({visible, monitor.scale});
+  if (settings_.seamless) {
+    // The window already follows the Windows monitor layout, so one area
+    // over all of it lets the rain cross from monitor to monitor. One pixel
+    // size fits all of it: the primary monitor's.
+    float scale = dpi_scale_;
+    for (const MonitorArea& monitor : monitors_) {
+      if (monitor.primary) scale = monitor.scale;
+    }
+    areas_.push_back({window, scale, true});
+  } else {
+    for (const MonitorArea& monitor : monitors_) {
+      RECT visible;
+      if (IntersectRect(&visible, &monitor.rect, &window)) {
+        areas_.push_back({visible, monitor.scale, monitor.primary});
+      }
     }
   }
-  if (areas_.empty()) areas_.push_back({window, dpi_scale_});
+  if (areas_.empty()) areas_.push_back({window, dpi_scale_, true});
   max_scale_ = 0.0f;
   for (const MonitorArea& area : areas_) {
     max_scale_ = std::max(max_scale_, area.scale);
@@ -1479,6 +1502,8 @@ bool RainRenderer::ApplySettings(const Settings& settings, double now_ms) {
   const bool layout_changed = settings.font_name != settings_.font_name ||
                               settings.layered != settings_.layered ||
                               settings.direction != settings_.direction ||
+                              settings.seamless !=
+                                  settings_.seamless ||
                               settings.font_scale != settings_.font_scale;
   // New colors start over from the first one.
   const bool colors_changed =
@@ -1493,6 +1518,7 @@ bool RainRenderer::ApplySettings(const Settings& settings, double now_ms) {
     color_start_ms_ = now_ms;
     current_color_ = settings_.colors.front();
   }
+  UpdateAreas();
   return EnsureAtlas() && (!layout_changed || ResetAnimation(now_ms));
 }
 
@@ -2142,6 +2168,11 @@ bool IsDesktopCovered() {
   return !monitors.empty() && remaining == 0;
 }
 
+struct RefreshRates {
+  int lowest = 0;
+  int highest = 0;
+};
+
 BOOL CALLBACK CollectMonitorRefreshRate(HMONITOR monitor, HDC, LPRECT,
                                         LPARAM param) {
   MONITORINFOEXW info = {};
@@ -2151,28 +2182,36 @@ BOOL CALLBACK CollectMonitorRefreshRate(HMONITOR monitor, HDC, LPRECT,
   if (GetMonitorInfoW(monitor, &info) &&
       EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) &&
       mode.dmDisplayFrequency > 1) {
-    int& rate = *reinterpret_cast<int*>(param);
-    rate = std::max(rate, static_cast<int>(mode.dmDisplayFrequency));
+    RefreshRates& rates = *reinterpret_cast<RefreshRates*>(param);
+    const int rate = static_cast<int>(mode.dmDisplayFrequency);
+    rates.lowest = rates.lowest ? std::min(rates.lowest, rate) : rate;
+    rates.highest = std::max(rates.highest, rate);
   }
   return TRUE;
 }
 
-// Returns the highest refresh rate of all monitors, which the animation
-// spans. Values 0 and 1 from EnumDisplaySettings mean the hardware default
-// and are ignored.
-int MaxMonitorRefreshRate() {
-  int rate = 0;
+// Returns the lowest and highest refresh rates of all monitors. Values 0
+// and 1 from EnumDisplaySettings mean the hardware default and are ignored.
+RefreshRates MonitorRefreshRates() {
+  RefreshRates rates;
   EnumDisplayMonitors(nullptr, nullptr, CollectMonitorRefreshRate,
-                      reinterpret_cast<LPARAM>(&rate));
-  return rate > 0 ? rate : kDefaultRefreshRate;
+                      reinterpret_cast<LPARAM>(&rates));
+  if (rates.highest == 0) rates = {kDefaultRefreshRate, kDefaultRefreshRate};
+  return rates;
 }
 
-// Resolves the requested frame limit to [kMinFrameLimit, the highest monitor
-// refresh rate].
-int EffectiveFrameLimit(int requested) {
-  const int monitor_max = MaxMonitorRefreshRate();
-  const int limit = requested <= 0 ? monitor_max : requested;
-  return std::max(kMinFrameLimit, std::min(limit, monitor_max));
+// The highest frame limit: the highest monitor refresh rate, or, with
+// seamless animation, the lowest, so every monitor shows every frame.
+int MaxFrameLimit(bool seamless) {
+  const RefreshRates rates = MonitorRefreshRates();
+  return seamless ? rates.lowest : rates.highest;
+}
+
+// Resolves the requested frame limit to [kMinFrameLimit, MaxFrameLimit()].
+int EffectiveFrameLimit(int requested, bool seamless) {
+  const int max_limit = MaxFrameLimit(seamless);
+  const int limit = requested <= 0 ? max_limit : requested;
+  return std::max(kMinFrameLimit, std::min(limit, max_limit));
 }
 
 // Reads a monitor's physical size from its EDID, in millimeters, as the
@@ -2296,6 +2335,7 @@ std::vector<MonitorArea> MonitorAreasFor(HWND window) {
     bool physical = false;
     MonitorArea area;
     area.scale = MonitorScale(monitor, info, &physical);
+    area.primary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
     area.rect = info.rcMonitor;
     MapWindowPoints(HWND_DESKTOP, window, reinterpret_cast<POINT*>(&area.rect),
                     2);
@@ -3018,7 +3058,8 @@ float DesktopWallpaper::DpiScale() const {
 }
 
 void DesktopWallpaper::ApplyFrameLimit() {
-  const int limit = EffectiveFrameLimit(settings_.frame_limit);
+  const int limit =
+      EffectiveFrameLimit(settings_.frame_limit, settings_.seamless);
   if (limit != frame_limit_) {
     Wh_Log(L"Frame limit: %d FPS", limit);
     frame_limit_ = limit;

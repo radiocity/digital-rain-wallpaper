@@ -38,7 +38,8 @@ Requires Windows 10 or 11 and a Direct3D 10 capable GPU.
 | Rain color | `#00FF00` | Color of the falling characters, `#RGB` or `#RRGGBB`. Several colors separated by commas or semicolons, like `#00FF00, #00CCFF; #FF2266`, change linearly from one to the next and back to the first. |
 | Color change time | 60 s | Seconds each change from one rain color to the next takes, from 1 to 3600. |
 | Speed | 100% | 25% to 400% of the original speed. |
-| Frame limit | 60 FPS | Maximum frames per second, from 24 up to the highest refresh rate of your monitors. `0` uses that refresh rate. The rain keeps its speed at any limit. |
+| Frame limit | 60 FPS | Maximum frames per second, from 24 up to the highest refresh rate of your monitors, or the lowest one with seamless animation. `0` uses that refresh rate. The rain keeps its speed at any limit. |
+| Seamless animation | Off | Plays one animation across all monitors as they are arranged in the Windows display settings, so the rain crosses from one monitor to the next. Characters take the primary monitor's size. Off, each monitor plays its own rain, sized to look the same on all of them. |
 | Character size | 13% | Size of the largest characters, 1% to 100% of 72 pt. Smaller layers keep their proportions. 13% is the original size. Characters have the same physical size on every monitor, measured from the size each monitor reports, or its display scale if it reports none. |
 | RSS feeds | Empty | RSS or Atom feed links, separated by commas or semicolons and optionally in quotes. Each column spells a headline from the feeds, then the next one. Feeds refresh every 15 minutes. A feed that can't be read shows an error at the bottom center, at the size of the FPS counter. Empty plays the original characters. |
 | Direction | Bottom | The characters fly to the top, left, right or bottom (original). They stay upright. |
