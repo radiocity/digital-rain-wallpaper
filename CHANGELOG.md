@@ -5,6 +5,18 @@ All notable changes to this mod are documented in this file. Entries follow
 versions follow [Semantic Versioning](https://semver.org/) with the project
 rule from [AGENTS.md](AGENTS.md): breaking changes bump MINOR, never MAJOR.
 
+## [0.7.0] - 2026-11-05
+
+### Features
+
+- rss: add an RSS feeds setting. Its comma or semicolon separated, optionally
+  quoted RSS or Atom links are fetched in the background and refreshed every
+  15 minutes, and the columns spell their headlines
+- rss: show one error line per unavailable feed at the bottom center, at the
+  size of the FPS counter
+- atlas: add the feed characters to the glyph atlas, drawn with fallback
+  fonts for scripts the chosen font lacks
+
 ## [0.6.0] - 2026-11-05
 
 ### Features

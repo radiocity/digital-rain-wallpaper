@@ -2,12 +2,12 @@
 // @id              digital-rain-wallpaper
 // @name            Digital Rain Wallpaper
 // @description     Plays a digital rain animation as the desktop background, rendered with Direct3D 11 behind the desktop icons
-// @version         0.6.0
+// @version         0.7.0
 // @author          radiocity
 // @github          https://github.com/radiocity
 // @license         GPL-3.0
 // @include         explorer.exe
-// @compilerOptions -ld3d11 -ld3dcompiler_47 -ldxgi -ldwmapi -lgdi32 -lwtsapi32
+// @compilerOptions -ld3d11 -ld3dcompiler_47 -ldxgi -ldwmapi -lgdi32 -lwtsapi32 -lole32 -loleaut32 -lmsxml6
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -30,6 +30,7 @@ animation spans all monitors.
 - Pauses while windows cover every monitor, while the session is locked and,
   optionally, on battery power.
 - Optional FPS counter in any corner of the primary monitor.
+- Optional RSS or Atom feeds: the columns spell the feed headlines.
 
 ## Settings
 
@@ -52,6 +53,13 @@ animation spans all monitors.
   rain layer.
 - **FPS counter position:** top left, top right, bottom left or bottom right
   of the primary monitor's work area.
+- **RSS feeds:** RSS or Atom feed links, separated by commas or semicolons
+  and optionally in quotes, for example
+  `https://www.alarabiya.net/feed/rss2/ar.xml; "https://feeds.feedburner.com/TheHackersNews"`.
+  Each column spells a headline from the feeds, then the next one. Feeds
+  refresh every 15 minutes. A feed that can't be read shows an error at the
+  bottom center, at the size of the FPS counter. Empty plays the original
+  characters.
 
 ## Credits
 
@@ -81,6 +89,9 @@ This mod is licensed under GPL-3.0.
 - frameLimit: 60
   $name: Frame limit (FPS)
   $description: Maximum frames per second, from 24 up to the highest refresh rate of your monitors. 0 uses that refresh rate. The rain keeps its speed at any limit.
+- rssFeeds: ""
+  $name: RSS feeds
+  $description: RSS or Atom feed links, separated by commas or semicolons, optionally in quotes. The columns spell the feed headlines. Empty plays the original characters.
 - direction: bottom
   $name: Direction
   $description: Direction the characters fly in. The characters stay upright.
@@ -171,6 +182,8 @@ This mod is licensed under GPL-3.0.
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <wtsapi32.h>
+#include <ole2.h>
+#include <msxml6.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -178,7 +191,9 @@ This mod is licensed under GPL-3.0.
 #include <cwchar>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <random>
 #include <string>
 #include <vector>
@@ -244,11 +259,31 @@ constexpr float kLargestFontSize = [] {
 constexpr int kMinAtlasEm = 48;
 constexpr int kMaxAtlasEm = 240;
 constexpr int kMaxAtlasWidth = 4096;
+constexpr int kMaxAtlasHeight = 8192;
+
+// Fonts for feed characters the chosen font lacks, tried in order: Latin,
+// Cyrillic, Greek, Arabic and Hebrew; Korean; Japanese; Chinese; Indic;
+// Thai; symbols.
+constexpr const wchar_t* kFallbackFonts[] = {
+    L"Segoe UI",    L"Malgun Gothic", L"Yu Gothic UI",   L"Microsoft YaHei UI",
+    L"Nirmala UI",  L"Leelawadee UI", L"Segoe UI Symbol"};
 constexpr float kAtlasMaxLod = 3.0f;
 
 constexpr wchar_t kDefaultFontName[] = L"MS Gothic";
 constexpr wchar_t kWindowClassName[] = L"DigitalRainWallpaper";
 constexpr UINT kMsgReloadSettings = WM_APP + 1;
+constexpr UINT kMsgFeedsUpdated = WM_APP + 2;
+
+constexpr DWORD kFeedRefreshMs = 15 * 60 * 1000;
+constexpr DWORD kFeedRetryMs = 60 * 1000;
+constexpr ULONGLONG kFeedTimeoutMs = 20 * 1000;
+constexpr size_t kMaxTitlesPerFeed = 50;
+constexpr size_t kMaxTitleLength = 200;
+constexpr size_t kMaxFeedErrorLines = 3;
+// Empty cells between two headlines in a column.
+constexpr int kTitleGap = 3;
+constexpr wchar_t kFeedUserAgent[] =
+    L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) DigitalRainWallpaper";
 constexpr UINT_PTR kHostTimerId = 1;
 constexpr UINT_PTR kPauseTimerId = 2;
 constexpr UINT kHostCheckIntervalMs = 1000;
@@ -386,9 +421,16 @@ struct Settings {
   std::wstring font_name = kDefaultFontName;
   bool pause_when_covered = true;
   bool pause_on_battery = false;
+  std::wstring rss_feeds;
   bool show_fps = false;
   FpsPosition fps_position = FpsPosition::kTopRight;
   Direction direction = Direction::kBottom;
+};
+
+// Headlines read from the feeds, and one message per feed that failed.
+struct FeedContent {
+  std::vector<std::wstring> titles;
+  std::vector<std::wstring> errors;
 };
 
 enum class FrameResult { kIdle, kPresented, kDeviceLost };
@@ -475,6 +517,10 @@ Settings LoadSettings() {
 
   settings.pause_when_covered = Wh_GetIntSetting(L"pauseWhenCovered") != 0;
   settings.pause_on_battery = Wh_GetIntSetting(L"pauseOnBattery") != 0;
+
+  PCWSTR rss_feeds = Wh_GetStringSetting(L"rssFeeds");
+  settings.rss_feeds = rss_feeds;
+  Wh_FreeStringSetting(rss_feeds);
   settings.show_fps = Wh_GetIntSetting(L"showFps") != 0;
 
   PCWSTR fps_position = Wh_GetStringSetting(L"fpsPosition");
@@ -546,21 +592,33 @@ ComPtr<ID3DBlob> CompileShader(const char* entry_point, const char* target) {
   return code;
 }
 
+HFONT CreateAtlasFont(const wchar_t* name, int em, DWORD pitch_and_family) {
+  return CreateFontW(-em, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                     DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                     ANTIALIASED_QUALITY, pitch_and_family, name);
+}
+
 // Texture with every character rasterized by GDI, one cell per character.
 // Cell 0 is solid white, for drawing filled rectangles.
 class GlyphAtlas {
  public:
-  // Rasterizes the characters with an em of `em` pixels.
+  // Rasterizes the original characters and extra_characters with an em of
+  // `em` pixels, or smaller when they don't fit in one texture.
+  // requested_em is for internal use.
   bool Build(ID3D11Device* device, ID3D11DeviceContext* context,
-             const std::wstring& font_name, int em);
+             const std::wstring& font_name, int em,
+             const std::wstring& extra_characters, int requested_em = 0);
 
   int glyph_count() const { return glyph_count_; }
-  int em() const { return em_; }
+  // The original characters are the first glyphs.
+  int base_glyph_count() const { return base_glyph_count_; }
+  int requested_em() const { return requested_em_; }
   const std::wstring& font_name() const { return font_name_; }
+  const std::wstring& extra_characters() const { return extra_characters_; }
+  // Characters of the glyphs, in glyph order.
+  const std::wstring& characters() const { return characters_; }
   ID3D11ShaderResourceView* view() const { return view_.Get(); }
 
-  // Returns the glyph of a character, or -1 if the atlas doesn't have it.
-  int FindGlyph(wchar_t character) const;
   float AdvancePx(int glyph, float font_px) const {
     return advances_[glyph] * font_px / em_;
   }
@@ -577,6 +635,9 @@ class GlyphAtlas {
  private:
   ComPtr<ID3D11ShaderResourceView> view_;
   std::wstring font_name_;
+  std::wstring extra_characters_;
+  int requested_em_ = 0;
+  int base_glyph_count_ = 0;
   int em_ = 1;
   int padding_ = 0;
   int columns_ = 1;
@@ -592,40 +653,91 @@ class GlyphAtlas {
 };
 
 bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
-                       const std::wstring& font_name, int em) {
-  const std::wstring candidates =
+                       const std::wstring& font_name, int em,
+                       const std::wstring& extra_characters,
+                       int requested_em) {
+  const std::wstring base_characters =
       std::wstring(kLatinCharacters) + kJapaneseCharacters;
 
   HDC dc = CreateCompatibleDC(nullptr);
   if (!dc) return false;
-  HFONT font = CreateFontW(-em, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                           DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                           ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN,
-                           font_name.c_str());
-  HGDIOBJ old_font = SelectObject(dc, font);
 
-  TEXTMETRICW metrics = {};
-  GetTextMetricsW(dc, &metrics);
+  // The chosen font draws the original characters. Feed characters it lacks
+  // come from the first fallback font that has them.
+  std::vector<HFONT> fonts = {
+      CreateAtlasFont(font_name.c_str(), em, FIXED_PITCH | FF_MODERN)};
+  if (!extra_characters.empty()) {
+    for (const wchar_t* fallback : kFallbackFonts) {
+      fonts.push_back(CreateAtlasFont(fallback, em, FF_DONTCARE));
+    }
+  }
+  const auto delete_fonts = [&fonts] {
+    for (HFONT font : fonts) DeleteObject(font);
+  };
+  HGDIOBJ old_font = SelectObject(dc, fonts[0]);
   wchar_t face_name[LF_FACESIZE] = {};
   GetTextFaceW(dc, LF_FACESIZE, face_name);
 
-  // Drops the characters the font has no glyph for.
-  std::wstring glyphs;
-  std::vector<WORD> indices(candidates.size());
-  if (GetGlyphIndicesW(dc, candidates.c_str(),
-                       static_cast<int>(candidates.size()), indices.data(),
+  struct AtlasGlyph {
+    wchar_t character;
+    size_t font;
+  };
+  std::vector<AtlasGlyph> glyphs;
+  std::wstring characters;
+
+  // Drops the original characters the font has no glyph for.
+  std::vector<WORD> indices(base_characters.size());
+  if (GetGlyphIndicesW(dc, base_characters.c_str(),
+                       static_cast<int>(base_characters.size()),
+                       indices.data(),
                        GGI_MARK_NONEXISTING_GLYPHS) != GDI_ERROR) {
-    for (size_t i = 0; i < candidates.size(); ++i) {
-      if (indices[i] != 0xFFFF) glyphs += candidates[i];
+    for (size_t i = 0; i < base_characters.size(); ++i) {
+      if (indices[i] != 0xFFFF) glyphs.push_back({base_characters[i], 0});
     }
   }
-  if (glyphs.empty()) glyphs = candidates;
+  if (glyphs.empty()) {
+    for (wchar_t character : base_characters) {
+      glyphs.push_back({character, 0});
+    }
+  }
+  const size_t base_glyph_count = glyphs.size();
+  for (const AtlasGlyph& glyph : glyphs) characters += glyph.character;
+
+  for (wchar_t character : extra_characters) {
+    if (characters.find(character) != std::wstring::npos) continue;
+    for (size_t font = 0; font < fonts.size(); ++font) {
+      SelectObject(dc, fonts[font]);
+      WORD index = 0xFFFF;
+      if (GetGlyphIndicesW(dc, &character, 1, &index,
+                           GGI_MARK_NONEXISTING_GLYPHS) == 1 &&
+          index != 0xFFFF) {
+        glyphs.push_back({character, font});
+        characters += character;
+        break;
+      }
+    }
+  }
+
+  // One baseline for every font, low enough for the tallest of them.
+  int ascent = 0;
+  int descent = 0;
+  std::vector<bool> font_used(fonts.size(), false);
+  for (const AtlasGlyph& glyph : glyphs) font_used[glyph.font] = true;
+  for (size_t font = 0; font < fonts.size(); ++font) {
+    if (!font_used[font]) continue;
+    SelectObject(dc, fonts[font]);
+    TEXTMETRICW metrics = {};
+    GetTextMetricsW(dc, &metrics);
+    ascent = std::max(ascent, static_cast<int>(metrics.tmAscent));
+    descent = std::max(descent, static_cast<int>(metrics.tmDescent));
+  }
 
   std::vector<float> advances;
   advances.reserve(glyphs.size());
-  for (wchar_t character : glyphs) {
+  for (const AtlasGlyph& glyph : glyphs) {
+    SelectObject(dc, fonts[glyph.font]);
     INT advance = 0;
-    if (!GetCharWidth32W(dc, character, character, &advance)) {
+    if (!GetCharWidth32W(dc, glyph.character, glyph.character, &advance)) {
       advance = em / 2;
     }
     advances.push_back(static_cast<float>(advance));
@@ -634,12 +746,21 @@ bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
   // The padding keeps neighboring cells apart down to mip kAtlasMaxLod.
   const int padding = std::max(4, em / 12);
   const int cell_width = em + 2 * padding;
-  const int cell_height = metrics.tmHeight + 2 * padding;
-  const int columns = std::min(32, kMaxAtlasWidth / cell_width);
+  const int cell_height = ascent + descent + 2 * padding;
+  const int columns = std::max(1, kMaxAtlasWidth / cell_width);
   const int cell_count = static_cast<int>(glyphs.size()) + 1;
   const int rows = (cell_count + columns - 1) / columns;
   const int width = columns * cell_width;
   const int height = rows * cell_height;
+
+  // Many feed characters at a large size don't fit; a smaller em does.
+  if (height > kMaxAtlasHeight && em > kMinAtlasEm / 2) {
+    SelectObject(dc, old_font);
+    delete_fonts();
+    DeleteDC(dc);
+    return Build(device, context, font_name, em * 3 / 4, extra_characters,
+                 requested_em ? requested_em : em);
+  }
 
   BITMAPINFO info = {};
   info.bmiHeader.biSize = sizeof(info.bmiHeader);
@@ -653,7 +774,7 @@ bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
       CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
   if (!bitmap) {
     SelectObject(dc, old_font);
-    DeleteObject(font);
+    delete_fonts();
     DeleteDC(dc);
     return false;
   }
@@ -663,11 +784,13 @@ bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
   FillRect(dc, &solid, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
   SetTextColor(dc, RGB(255, 255, 255));
   SetBkMode(dc, TRANSPARENT);
-  SetTextAlign(dc, TA_LEFT | TA_TOP | TA_NOUPDATECP);
+  SetTextAlign(dc, TA_LEFT | TA_BASELINE | TA_NOUPDATECP);
   for (size_t i = 0; i < glyphs.size(); ++i) {
     const int cell = static_cast<int>(i) + 1;
+    SelectObject(dc, fonts[glyphs[i].font]);
     TextOutW(dc, (cell % columns) * cell_width + padding,
-             (cell / columns) * cell_height + padding, &glyphs[i], 1);
+             (cell / columns) * cell_height + padding + ascent,
+             &glyphs[i].character, 1);
   }
   GdiFlush();
 
@@ -683,7 +806,7 @@ bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
   SelectObject(dc, old_bitmap);
   DeleteObject(bitmap);
   SelectObject(dc, old_font);
-  DeleteObject(font);
+  delete_fonts();
   DeleteDC(dc);
 
   D3D11_TEXTURE2D_DESC desc = {};
@@ -711,27 +834,25 @@ bool GlyphAtlas::Build(ID3D11Device* device, ID3D11DeviceContext* context,
 
   view_ = view;
   font_name_ = font_name;
+  requested_em_ = requested_em ? requested_em : em;
+  extra_characters_ = extra_characters;
   em_ = em;
   padding_ = padding;
   columns_ = columns;
   glyph_count_ = static_cast<int>(glyphs.size());
-  characters_ = glyphs;
+  base_glyph_count_ = static_cast<int>(base_glyph_count);
+  characters_ = characters;
   advances_ = std::move(advances);
   cell_width_ = static_cast<float>(cell_width);
   cell_height_ = static_cast<float>(cell_height);
-  ascent_ = static_cast<float>(metrics.tmAscent);
-  descent_ = static_cast<float>(metrics.tmDescent);
+  ascent_ = static_cast<float>(ascent);
+  descent_ = static_cast<float>(descent);
   texture_width_ = static_cast<float>(width);
   texture_height_ = static_cast<float>(height);
-  Wh_Log(L"Glyph atlas: font \"%s\", em %d, %d of %d characters, %dx%d",
-         face_name, em_, glyph_count_, static_cast<int>(candidates.size()),
-         width, height);
+  Wh_Log(L"Glyph atlas: font \"%s\", em %d, %d characters (%d original), "
+         L"%dx%d",
+         face_name, em_, glyph_count_, base_glyph_count_, width, height);
   return true;
-}
-
-int GlyphAtlas::FindGlyph(wchar_t character) const {
-  const size_t index = characters_.find(character);
-  return index == std::wstring::npos ? -1 : static_cast<int>(index);
 }
 
 GlyphInstance GlyphAtlas::MakeGlyph(int glyph, float x, float baseline,
@@ -790,6 +911,10 @@ class RainRenderer {
     frame_interval_ms_ = 1000.0 / fps;
   }
 
+  // With titles, the columns spell them instead of random characters. The
+  // errors show at the bottom center.
+  bool SetFeedContent(const FeedContent& content);
+
   // Restarts the frame clocks, so a long pause doesn't cause a burst of
   // catch-up steps.
   void Resume(double now_ms);
@@ -807,6 +932,10 @@ class RainRenderer {
     float font_px = 0.0f;
     std::vector<int> drops;
     std::vector<float> delays;
+    // With feed titles: the title each column spells and the position of
+    // its drop in it. Position -1 is the row above the canvas.
+    std::vector<int> column_titles;
+    std::vector<int> column_offsets;
     double last_step_ms = 0.0;
   };
 
@@ -829,6 +958,16 @@ class RainRenderer {
   void Composite(double now_ms);
   void CompositeOverlay(double now_ms);
   void DrawFpsCounter();
+  void DrawFeedErrors();
+  // Text in the glyphs of the atlas. Missing characters, like the space,
+  // only advance.
+  float MeasureText(const std::wstring& text, float font_px) const;
+  void AppendText(const std::wstring& text, float left, float top,
+                  float font_px);
+  void AppendTextBackdrop(float left, float top, float width, float font_px);
+  void MapTitleGlyphs();
+  int NextTitle();
+  void AssignTitle(RainLayer& layer, size_t column);
   void CountPresentedFrame(double now_ms);
   void Blur(ID3D11ShaderResourceView* source);
 
@@ -886,6 +1025,17 @@ class RainRenderer {
   int fps_frames_ = 0;
   double fps_window_start_ms_ = 0.0;
 
+  std::vector<std::wstring> feed_titles_;
+  std::vector<std::wstring> feed_errors_;
+  // Unique characters of the titles, for the atlas.
+  std::wstring feed_characters_;
+  // Glyph of every atlas character.
+  std::unordered_map<wchar_t, int> glyph_lookup_;
+  // Glyphs of each title; -1 for characters with no glyph.
+  std::vector<std::vector<int>> title_glyphs_;
+  int next_title_ = 0;
+  bool content_changed_ = false;
+
   int frame_limit_ = kDefaultRefreshRate;
   double frame_interval_ms_ = 1000.0 / kDefaultRefreshRate;
   double last_present_ms_ = 0.0;
@@ -916,11 +1066,75 @@ bool RainRenderer::EnsureAtlas() {
       static_cast<int>(kLargestFontSize * dpi_scale_ * settings_.font_scale +
                        0.5f),
       kMinAtlasEm, kMaxAtlasEm);
-  if (atlas_.view() && atlas_.em() == em &&
-      atlas_.font_name() == settings_.font_name) {
+  if (atlas_.view() && atlas_.requested_em() == em &&
+      atlas_.font_name() == settings_.font_name &&
+      atlas_.extra_characters() == feed_characters_) {
     return true;
   }
-  return atlas_.Build(device_.Get(), context_.Get(), settings_.font_name, em);
+  if (!atlas_.Build(device_.Get(), context_.Get(), settings_.font_name, em,
+                    feed_characters_)) {
+    return false;
+  }
+  // A new atlas renumbers the glyphs.
+  MapTitleGlyphs();
+  return true;
+}
+
+bool RainRenderer::SetFeedContent(const FeedContent& content) {
+  feed_titles_ = content.titles;
+  feed_errors_ = content.errors;
+  std::wstring characters;
+  for (const std::wstring& title : feed_titles_) {
+    for (wchar_t character : title) {
+      if (character != L' ' &&
+          characters.find(character) == std::wstring::npos) {
+        characters += character;
+      }
+    }
+  }
+  std::sort(characters.begin(), characters.end());
+  feed_characters_ = characters;
+  if (!EnsureAtlas()) return false;
+  MapTitleGlyphs();
+
+  next_title_ = 0;
+  for (RainLayer& layer : layers_) {
+    for (size_t column = 0; column < layer.drops.size(); ++column) {
+      AssignTitle(layer, column);
+    }
+  }
+  content_changed_ = true;
+  return true;
+}
+
+void RainRenderer::MapTitleGlyphs() {
+  glyph_lookup_.clear();
+  const std::wstring& characters = atlas_.characters();
+  for (size_t i = 0; i < characters.size(); ++i) {
+    glyph_lookup_.emplace(characters[i], static_cast<int>(i));
+  }
+  title_glyphs_.clear();
+  for (const std::wstring& title : feed_titles_) {
+    std::vector<int>& title_glyphs = title_glyphs_.emplace_back();
+    for (wchar_t character : title) {
+      const auto found = glyph_lookup_.find(character);
+      title_glyphs.push_back(found == glyph_lookup_.end() ? -1
+                                                          : found->second);
+    }
+  }
+}
+
+// Hands out the titles in turn, so neighboring columns spell different ones.
+int RainRenderer::NextTitle() {
+  if (title_glyphs_.empty()) return -1;
+  const int title = next_title_;
+  next_title_ = (next_title_ + 1) % static_cast<int>(title_glyphs_.size());
+  return title;
+}
+
+void RainRenderer::AssignTitle(RainLayer& layer, size_t column) {
+  layer.column_titles[column] = NextTitle();
+  layer.column_offsets[column] = -1;
 }
 
 bool RainRenderer::CreateDevice() {
@@ -1141,6 +1355,11 @@ bool RainRenderer::ResetAnimation(double now_ms) {
     const int columns = std::max(1, static_cast<int>(across / layer.font_px));
     layer.drops.assign(columns, 0);
     layer.delays.assign(columns, 0.0f);
+    layer.column_titles.assign(columns, -1);
+    layer.column_offsets.assign(columns, -1);
+    for (int column = 0; column < columns; ++column) {
+      AssignTitle(layer, column);
+    }
     if (!CreateRenderTexture(device_.Get(), width_, height_,
                              &layer.texture)) {
       return false;
@@ -1174,8 +1393,10 @@ float RainRenderer::BlurAmount(double now_ms) const {
   return overlay_blurred_ ? eased : 1.0f - eased;
 }
 
+// The rain keeps the original characters; feed characters only appear in
+// titles.
 int RainRenderer::RandomGlyph() {
-  const int count = atlas_.glyph_count();
+  const int count = atlas_.base_glyph_count();
   return std::min(static_cast<int>(Random() * count), count - 1);
 }
 
@@ -1221,6 +1442,11 @@ FrameResult RainRenderer::Advance(double now_ms) {
       next_blur_toggle_ms_ = now_ms + kOverlayBlurToggleMs;
     }
     if (BlurAmount(now_ms) != presented_blur_amount_) dirty = true;
+  }
+
+  if (content_changed_) {
+    content_changed_ = false;
+    dirty = true;
   }
 
   if (!dirty) return FrameResult::kIdle;
@@ -1274,11 +1500,25 @@ void RainRenderer::StepLayer(RainLayer& layer) {
   // The original falls down; the other directions mirror or turn the path,
   // and the glyphs stay upright.
   const float along_limit = IsHorizontal() ? width_ : height_;
+  const bool spell_titles = !title_glyphs_.empty();
   for (size_t i = 0; i < layer.drops.size(); ++i) {
     const float across = i * font_px;
     const float along = layer.drops[i] * font_px;
+
+    // Titles leave their spaces and the gap between them empty.
+    int glyph = -1;
+    if (!spell_titles) {
+      glyph = RandomGlyph();
+    } else if (layer.column_titles[i] >= 0) {
+      const std::vector<int>& title = title_glyphs_[layer.column_titles[i]];
+      const int offset = layer.column_offsets[i];
+      if (offset >= 0 && offset < static_cast<int>(title.size())) {
+        glyph = title[offset];
+      }
+    }
+
     // The original also draws past the canvas; those glyphs are skipped.
-    if (along - 2.0f * font_px < along_limit) {
+    if (glyph >= 0 && along - 2.0f * font_px < along_limit) {
       float x = across;
       float baseline = along;
       switch (settings_.direction) {
@@ -1296,19 +1536,28 @@ void RainRenderer::StepLayer(RainLayer& layer) {
           baseline = across + font_px;
           break;
       }
-      glyphs_.push_back(atlas_.MakeGlyph(RandomGlyph(), x, baseline, font_px,
-                                         settings_.color));
+      glyphs_.push_back(
+          atlas_.MakeGlyph(glyph, x, baseline, font_px, settings_.color));
     }
 
     if (layer.delays[i] <= 0.0f) {
       ++layer.drops[i];
       layer.delays[i] = Random() * (config.delay_factor / config.speed_factor);
+      // A column moves on to the next title after a gap.
+      if (spell_titles && layer.column_titles[i] >= 0 &&
+          ++layer.column_offsets[i] >=
+              static_cast<int>(title_glyphs_[layer.column_titles[i]].size()) +
+                  kTitleGap) {
+        layer.column_titles[i] = NextTitle();
+        layer.column_offsets[i] = 0;
+      }
     } else {
       layer.delays[i] -= 1.0f;
     }
 
     if (along > along_limit && Random() > 1.0f - kDropResetChance) {
       layer.drops[i] = 0;
+      if (spell_titles) AssignTitle(layer, i);
     }
   }
 
@@ -1353,6 +1602,7 @@ void RainRenderer::Composite(double now_ms) {
 
   if (settings_.layered) CompositeOverlay(now_ms);
   DrawFpsCounter();
+  DrawFeedErrors();
 }
 
 void RainRenderer::CompositeOverlay(double now_ms) {
@@ -1386,19 +1636,10 @@ void RainRenderer::DrawFpsCounter() {
       L"FPS: " + (fps_ < 0 ? std::wstring(L"--") : std::to_wstring(fps_)) +
       L" (" + std::to_wstring(frame_limit_) + L")";
 
-  // Characters missing from the atlas, like the space, only advance.
-  const float missing_advance = 0.5f * font_px;
-  float text_width = 0.0f;
-  for (wchar_t character : text) {
-    const int glyph = atlas_.FindGlyph(character);
-    text_width +=
-        glyph < 0 ? missing_advance : atlas_.AdvancePx(glyph, font_px);
-  }
-  const float ascent = atlas_.AscentPx(font_px);
-  const float text_height = ascent + atlas_.DescentPx(font_px);
-
+  const float text_width = MeasureText(text, font_px);
+  const float text_height =
+      atlas_.AscentPx(font_px) + atlas_.DescentPx(font_px);
   const float margin = font_px;
-  const float padding = 0.5f * font_px;
   const bool right = settings_.fps_position == FpsPosition::kTopRight ||
                      settings_.fps_position == FpsPosition::kBottomRight;
   const bool bottom = settings_.fps_position == FpsPosition::kBottomLeft ||
@@ -1409,23 +1650,83 @@ void RainRenderer::DrawFpsCounter() {
                            : counter_area_.top + margin;
 
   glyphs_.clear();
-  glyphs_.push_back(atlas_.MakeSolid(
-      left - padding, top - padding, text_width + 2.0f * padding,
-      text_height + 2.0f * padding, {0.0f, 0.0f, 0.0f, kFpsBackdropAlpha}));
-  float x = left;
-  for (wchar_t character : text) {
-    const int glyph = atlas_.FindGlyph(character);
-    if (glyph < 0) {
-      x += missing_advance;
-      continue;
-    }
-    glyphs_.push_back(
-        atlas_.MakeGlyph(glyph, x, top + ascent, font_px, settings_.color));
-    x += atlas_.AdvancePx(glyph, font_px);
-  }
-
+  AppendTextBackdrop(left, top, text_width, font_px);
+  AppendText(text, left, top, font_px);
   SetTarget(back_buffer_.Get(), width_, height_);
   DrawGlyphs(glyphs_, straight_blend_.Get());
+}
+
+// Draws one line per failed feed at the bottom center of the counter area,
+// at the size of the FPS counter.
+void RainRenderer::DrawFeedErrors() {
+  if (feed_errors_.empty() || layers_.empty()) return;
+  const float font_px = layers_.front().font_px;
+  std::vector<std::wstring> lines(
+      feed_errors_.begin(),
+      feed_errors_.begin() +
+          std::min(feed_errors_.size(), kMaxFeedErrorLines));
+  if (feed_errors_.size() > kMaxFeedErrorLines) {
+    lines.back() = L"+" +
+                   std::to_wstring(feed_errors_.size() - lines.size() + 1) +
+                   L" RSS feeds unavailable";
+  }
+
+  const float text_height =
+      atlas_.AscentPx(font_px) + atlas_.DescentPx(font_px);
+  // The backdrops of neighboring lines touch.
+  const float line_step = text_height + font_px;
+  const float center = (counter_area_.left + counter_area_.right) / 2.0f;
+  glyphs_.clear();
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const std::wstring& line = lines[lines.size() - 1 - i];
+    const float width = MeasureText(line, font_px);
+    const float left = center - width / 2.0f;
+    const float top =
+        counter_area_.bottom - font_px - text_height - i * line_step;
+    AppendTextBackdrop(left, top, width, font_px);
+    AppendText(line, left, top, font_px);
+  }
+  SetTarget(back_buffer_.Get(), width_, height_);
+  DrawGlyphs(glyphs_, straight_blend_.Get());
+}
+
+float RainRenderer::MeasureText(const std::wstring& text,
+                                float font_px) const {
+  float width = 0.0f;
+  for (wchar_t character : text) {
+    const auto found = glyph_lookup_.find(character);
+    width += found == glyph_lookup_.end()
+                 ? 0.5f * font_px
+                 : atlas_.AdvancePx(found->second, font_px);
+  }
+  return width;
+}
+
+void RainRenderer::AppendText(const std::wstring& text, float left,
+                              float top, float font_px) {
+  const float baseline = top + atlas_.AscentPx(font_px);
+  float x = left;
+  for (wchar_t character : text) {
+    const auto found = glyph_lookup_.find(character);
+    if (found == glyph_lookup_.end()) {
+      x += 0.5f * font_px;
+      continue;
+    }
+    glyphs_.push_back(atlas_.MakeGlyph(found->second, x, baseline, font_px,
+                                       settings_.color));
+    x += atlas_.AdvancePx(found->second, font_px);
+  }
+}
+
+// A translucent box that keeps text readable over the rain.
+void RainRenderer::AppendTextBackdrop(float left, float top, float width,
+                                      float font_px) {
+  const float padding = 0.5f * font_px;
+  const float height = atlas_.AscentPx(font_px) + atlas_.DescentPx(font_px);
+  glyphs_.push_back(atlas_.MakeSolid(left - padding, top - padding,
+                                     width + 2.0f * padding,
+                                     height + 2.0f * padding,
+                                     {0.0f, 0.0f, 0.0f, kFpsBackdropAlpha}));
 }
 
 // Separable Gaussian blur into blur_vertical_.
@@ -1686,6 +1987,344 @@ bool IsOnBattery() {
   return GetSystemPowerStatus(&status) && status.ACLineStatus == 0;
 }
 
+std::wstring TrimSpaces(const std::wstring& text) {
+  const size_t begin = text.find_first_not_of(L" \t\r\n");
+  if (begin == std::wstring::npos) return L"";
+  const size_t end = text.find_last_not_of(L" \t\r\n");
+  return text.substr(begin, end - begin + 1);
+}
+
+// Splits the setting into links. Links are separated by commas or
+// semicolons, and may be quoted with "", '' or curly quotes.
+std::vector<std::wstring> ParseFeedLinks(const std::wstring& text) {
+  std::vector<std::wstring> links;
+  size_t i = 0;
+  while (i < text.size()) {
+    while (i < text.size() &&
+           (iswspace(text[i]) || text[i] == L',' || text[i] == L';')) {
+      ++i;
+    }
+    if (i >= text.size()) break;
+
+    std::wstring link;
+    const wchar_t open = text[i];
+    if (open == L'"' || open == L'\'' || open == L'“') {
+      const wchar_t close = open == L'“' ? L'”' : open;
+      const size_t end = text.find(close, i + 1);
+      link = text.substr(i + 1, end == std::wstring::npos
+                                    ? std::wstring::npos
+                                    : end - i - 1);
+      i = end == std::wstring::npos ? text.size() : end + 1;
+    } else {
+      const size_t end = text.find_first_of(L",;", i);
+      link = text.substr(
+          i, end == std::wstring::npos ? std::wstring::npos : end - i);
+      i = end == std::wstring::npos ? text.size() : end;
+    }
+    link = TrimSpaces(link);
+    if (!link.empty()) links.push_back(link);
+  }
+  return links;
+}
+
+// Collapses whitespace and drops control and surrogate characters, which
+// the atlas can't hold.
+std::wstring NormalizeTitle(const wchar_t* text, size_t length) {
+  std::wstring title;
+  bool pending_space = false;
+  for (size_t i = 0; i < length && title.size() < kMaxTitleLength; ++i) {
+    const wchar_t character = text[i];
+    if (iswspace(character)) {
+      pending_space = !title.empty();
+      continue;
+    }
+    if (iswcntrl(character) || (character >= 0xD800 && character <= 0xDFFF)) {
+      continue;
+    }
+    if (pending_space) title += L' ';
+    pending_space = false;
+    title += character;
+  }
+  return title;
+}
+
+std::wstring FeedErrorReason(HRESULT result) {
+  switch (result) {
+    case static_cast<HRESULT>(0x80072EE7):
+      return L"host not found";
+    case static_cast<HRESULT>(0x80072EE2):
+      return L"timed out";
+    case static_cast<HRESULT>(0x80072EFD):
+    case static_cast<HRESULT>(0x80072EFE):
+      return L"cannot connect";
+    case static_cast<HRESULT>(0x80072F06):
+    case static_cast<HRESULT>(0x80072F7D):
+    case static_cast<HRESULT>(0x80072F8F):
+      return L"secure connection failed";
+  }
+  wchar_t reason[32];
+  swprintf(reason, std::size(reason), L"error 0x%08lX",
+           static_cast<unsigned long>(result));
+  return reason;
+}
+
+// Owns a BSTR for one call.
+class ScopedBstr {
+ public:
+  explicit ScopedBstr(const wchar_t* text) : value_(SysAllocString(text)) {}
+  ScopedBstr(const ScopedBstr&) = delete;
+  ScopedBstr& operator=(const ScopedBstr&) = delete;
+  ~ScopedBstr() { SysFreeString(value_); }
+  BSTR get() const { return value_; }
+
+ private:
+  BSTR value_;
+};
+
+// Downloads the feeds on its own thread, so slow servers never stall the
+// animation, and posts kMsgFeedsUpdated to the render thread with each
+// result.
+class FeedFetcher {
+ public:
+  explicit FeedFetcher(DWORD notify_thread_id)
+      : notify_thread_id_(notify_thread_id) {}
+  FeedFetcher(const FeedFetcher&) = delete;
+  FeedFetcher& operator=(const FeedFetcher&) = delete;
+  ~FeedFetcher();
+
+  bool Start();
+  // Fetches the links now if they changed, then on a schedule.
+  void SetLinks(const std::vector<std::wstring>& links);
+  FeedContent TakeContent();
+
+ private:
+  static DWORD WINAPI ThreadProc(void* param);
+  void Run();
+  bool IsStopping() const {
+    return WaitForSingleObject(stop_event_, 0) == WAIT_OBJECT_0;
+  }
+  // Returns false and sets error when the feed can't be read. A stop
+  // returns false with an empty error.
+  bool FetchFeed(const std::wstring& link, std::vector<std::wstring>* titles,
+                 std::wstring* error);
+
+  const DWORD notify_thread_id_;
+  HANDLE thread_ = nullptr;
+  HANDLE stop_event_ = nullptr;
+  HANDLE wake_event_ = nullptr;
+
+  std::mutex mutex_;
+  std::vector<std::wstring> links_;  // Guarded by mutex_.
+  bool links_set_ = false;           // Guarded by mutex_.
+  FeedContent content_;              // Guarded by mutex_.
+};
+
+FeedFetcher::~FeedFetcher() {
+  if (thread_) {
+    SetEvent(stop_event_);
+    WaitForSingleObject(thread_, INFINITE);
+    CloseHandle(thread_);
+  }
+  if (wake_event_) CloseHandle(wake_event_);
+  if (stop_event_) CloseHandle(stop_event_);
+}
+
+bool FeedFetcher::Start() {
+  stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  wake_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (!stop_event_ || !wake_event_) return false;
+  thread_ = CreateThread(nullptr, 0, ThreadProc, this, 0, nullptr);
+  return thread_ != nullptr;
+}
+
+void FeedFetcher::SetLinks(const std::vector<std::wstring>& links) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (links_set_ && links == links_) return;
+    links_ = links;
+    links_set_ = true;
+  }
+  SetEvent(wake_event_);
+}
+
+FeedContent FeedFetcher::TakeContent() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return content_;
+}
+
+DWORD WINAPI FeedFetcher::ThreadProc(void* param) {
+  static_cast<FeedFetcher*>(param)->Run();
+  return 0;
+}
+
+void FeedFetcher::Run() {
+  const bool com_initialized =
+      SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+  const HANDLE handles[] = {stop_event_, wake_event_};
+  DWORD wait_ms = INFINITE;
+  for (;;) {
+    const DWORD wait = WaitForMultipleObjects(std::size(handles), handles,
+                                              FALSE, wait_ms);
+    if (wait != WAIT_OBJECT_0 + 1 && wait != WAIT_TIMEOUT) break;
+
+    std::vector<std::wstring> links;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      links = links_;
+    }
+    FeedContent content;
+    for (const std::wstring& link : links) {
+      std::vector<std::wstring> titles;
+      std::wstring error;
+      if (FetchFeed(link, &titles, &error)) {
+        Wh_Log(L"Feed %s: %d titles", link.c_str(),
+               static_cast<int>(titles.size()));
+        content.titles.insert(content.titles.end(), titles.begin(),
+                              titles.end());
+      } else if (!error.empty()) {
+        Wh_Log(L"Feed %s: %s", link.c_str(), error.c_str());
+        content.errors.push_back(L"RSS feed unavailable: " + link + L" (" +
+                                 error + L")");
+      }
+      if (IsStopping()) break;
+    }
+    if (IsStopping()) break;
+
+    wait_ms = links.empty()            ? INFINITE
+              : content.errors.empty() ? kFeedRefreshMs
+                                       : kFeedRetryMs;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      content_ = std::move(content);
+    }
+    PostThreadMessageW(notify_thread_id_, kMsgFeedsUpdated, 0, 0);
+  }
+  if (com_initialized) CoUninitialize();
+}
+
+bool FeedFetcher::FetchFeed(const std::wstring& link,
+                            std::vector<std::wstring>* titles,
+                            std::wstring* error) {
+  if (link.compare(0, 7, L"http://") != 0 &&
+      link.compare(0, 8, L"https://") != 0) {
+    *error = L"not an http or https link";
+    return false;
+  }
+
+  ComPtr<IServerXMLHTTPRequest> request;
+  HRESULT result =
+      CoCreateInstance(CLSID_ServerXMLHTTP60, nullptr, CLSCTX_INPROC_SERVER,
+                       IID_PPV_ARGS(&request));
+  if (FAILED(result)) {
+    *error = L"MSXML 6 unavailable";
+    return false;
+  }
+
+  // An asynchronous request can be abandoned when the mod unloads.
+  VARIANT async;
+  VariantInit(&async);
+  async.vt = VT_BOOL;
+  async.boolVal = VARIANT_TRUE;
+  VARIANT empty;
+  VariantInit(&empty);
+  request->setTimeouts(10000, 10000, 10000, 15000);
+  result = request->open(ScopedBstr(L"GET").get(),
+                         ScopedBstr(link.c_str()).get(), async, empty, empty);
+  if (SUCCEEDED(result)) {
+    request->setRequestHeader(ScopedBstr(L"User-Agent").get(),
+                              ScopedBstr(kFeedUserAgent).get());
+    result = request->send(empty);
+  }
+  if (FAILED(result)) {
+    *error = FeedErrorReason(result);
+    return false;
+  }
+
+  const ULONGLONG deadline = GetTickCount64() + kFeedTimeoutMs;
+  for (;;) {
+    VARIANT timeout;
+    VariantInit(&timeout);
+    timeout.vt = VT_I4;
+    timeout.lVal = 1;  // Seconds.
+    VARIANT_BOOL done = VARIANT_FALSE;
+    result = request->waitForResponse(timeout, &done);
+    if (FAILED(result)) {
+      *error = FeedErrorReason(result);
+      return false;
+    }
+    if (done) break;
+    if (IsStopping()) {
+      request->abort();
+      return false;
+    }
+    if (GetTickCount64() > deadline) {
+      request->abort();
+      *error = L"timed out";
+      return false;
+    }
+  }
+
+  long status = 0;
+  result = request->get_status(&status);
+  if (FAILED(result)) {
+    *error = FeedErrorReason(result);
+    return false;
+  }
+  if (status != 200) {
+    *error = L"HTTP " + std::to_wstring(status);
+    return false;
+  }
+
+  // Loading the raw bytes lets MSXML detect the encoding from the XML.
+  VARIANT body;
+  VariantInit(&body);
+  ComPtr<IXMLDOMDocument2> document;
+  VARIANT_BOOL loaded = VARIANT_FALSE;
+  if (SUCCEEDED(request->get_responseBody(&body)) &&
+      SUCCEEDED(CoCreateInstance(CLSID_DOMDocument60, nullptr,
+                                 CLSCTX_INPROC_SERVER,
+                                 IID_PPV_ARGS(&document)))) {
+    document->put_async(VARIANT_FALSE);
+    document->put_validateOnParse(VARIANT_FALSE);
+    document->put_resolveExternals(VARIANT_FALSE);
+    document->load(body, &loaded);
+  }
+  VariantClear(&body);
+  if (!loaded) {
+    *error = L"not a valid feed";
+    return false;
+  }
+
+  // RSS items and Atom entries, in any namespace.
+  ComPtr<IXMLDOMNodeList> nodes;
+  long length = 0;
+  if (FAILED(document->selectNodes(
+          ScopedBstr(L"//*[local-name()='item']/*[local-name()='title'] | "
+                     L"//*[local-name()='entry']/*[local-name()='title']")
+              .get(),
+          &nodes)) ||
+      FAILED(nodes->get_length(&length))) {
+    *error = L"not a valid feed";
+    return false;
+  }
+  for (long i = 0; i < length && titles->size() < kMaxTitlesPerFeed; ++i) {
+    ComPtr<IXMLDOMNode> node;
+    BSTR text = nullptr;
+    if (FAILED(nodes->get_item(i, &node)) || !node ||
+        FAILED(node->get_text(&text))) {
+      continue;
+    }
+    std::wstring title = NormalizeTitle(text, SysStringLen(text));
+    SysFreeString(text);
+    if (!title.empty()) titles->push_back(std::move(title));
+  }
+  if (titles->empty()) {
+    *error = L"no titles";
+    return false;
+  }
+  return true;
+}
+
 // Click-through child window of the wallpaper host, driven by a message loop
 // on the render thread.
 class DesktopWallpaper {
@@ -1714,6 +2353,7 @@ class DesktopWallpaper {
   float DpiScale() const;
   RECT CounterArea() const;
   void ApplyFrameLimit();
+  void ApplyFeedContent();
 
   HWND host_ = nullptr;
   HWND window_ = nullptr;
@@ -1731,10 +2371,15 @@ class DesktopWallpaper {
   int frame_limit_ = 0;
   Settings settings_;
   std::unique_ptr<RainRenderer> renderer_;
+  std::unique_ptr<FeedFetcher> feed_fetcher_;
+  // Kept for renderers recreated after a lost device.
+  FeedContent feed_content_;
 };
 
 DesktopWallpaper::~DesktopWallpaper() {
   destroying_ = true;
+  // Waits for a download in progress to abort, about a second at most.
+  feed_fetcher_.reset();
   renderer_.reset();
   if (window_) {
     if (session_registered_) WTSUnRegisterSessionNotification(window_);
@@ -1803,6 +2448,14 @@ bool DesktopWallpaper::Create(HWND host) {
   if (!CreateRenderer()) return false;
   Wh_Log(L"Attached to host 0x%p, %dx%d, DPI scale %.2f", host_, width_,
          height_, dpi_scale_);
+
+  feed_fetcher_ = std::make_unique<FeedFetcher>(GetCurrentThreadId());
+  if (feed_fetcher_->Start()) {
+    feed_fetcher_->SetLinks(ParseFeedLinks(settings_.rss_feeds));
+  } else {
+    Wh_Log(L"Starting the feed thread failed: %lu", GetLastError());
+    feed_fetcher_.reset();
+  }
   ScheduleFrame(0.0);
   UpdatePauseState();
   return true;
@@ -1826,6 +2479,10 @@ RunResult DesktopWallpaper::Run() {
       if (message.message == WM_QUIT) return RunResult::kStopped;
       if (!message.hwnd && message.message == kMsgReloadSettings) {
         ReloadSettings();
+        continue;
+      }
+      if (!message.hwnd && message.message == kMsgFeedsUpdated) {
+        ApplyFeedContent();
         continue;
       }
       TranslateMessage(&message);
@@ -1901,7 +2558,22 @@ bool DesktopWallpaper::CreateRenderer() {
   renderer_ = std::move(renderer);
   renderer_->SetCounterArea(CounterArea());
   ApplyFrameLimit();
+  if (!feed_content_.titles.empty() || !feed_content_.errors.empty()) {
+    renderer_->SetFeedContent(feed_content_);
+  }
   return true;
+}
+
+void DesktopWallpaper::ApplyFeedContent() {
+  if (!feed_fetcher_) return;
+  feed_content_ = feed_fetcher_->TakeContent();
+  Wh_Log(L"Feeds: %d titles, %d errors",
+         static_cast<int>(feed_content_.titles.size()),
+         static_cast<int>(feed_content_.errors.size()));
+  if (renderer_ && !renderer_->SetFeedContent(feed_content_)) {
+    renderer_.reset();
+  }
+  if (!paused_) ScheduleFrame(0.0);
 }
 
 void DesktopWallpaper::RenderFrame() {
@@ -1939,6 +2611,9 @@ void DesktopWallpaper::ReloadSettings() {
     renderer_.reset();
   }
   ApplyFrameLimit();
+  if (feed_fetcher_) {
+    feed_fetcher_->SetLinks(ParseFeedLinks(settings_.rss_feeds));
+  }
   UpdatePauseState();
   if (!paused_) ScheduleFrame(0.0);
 }

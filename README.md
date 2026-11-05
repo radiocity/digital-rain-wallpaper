@@ -16,6 +16,7 @@ working. One animation spans all monitors.
 - Pauses while windows cover every monitor, while the session is locked and,
   optionally, on battery power.
 - Optional FPS counter in any corner of the primary monitor.
+- Optional RSS or Atom feeds: the columns spell the feed headlines.
 - Recovers when Explorer recreates the desktop or the graphics device is lost.
 
 ## Install
@@ -37,6 +38,7 @@ Requires Windows 10 or 11 and a Direct3D 10 capable GPU.
 | Speed | 100% | 25% to 400% of the original speed. |
 | Frame limit | 60 FPS | Maximum frames per second, from 24 up to the highest refresh rate of your monitors. `0` uses that refresh rate. The rain keeps its speed at any limit. |
 | Character size | 13% | Size of the largest characters, 1% to 100% of 72 pt. Smaller layers keep their proportions. 13% is the original size. The display DPI scales it further. |
+| RSS feeds | Empty | RSS or Atom feed links, separated by commas or semicolons and optionally in quotes. Each column spells a headline from the feeds, then the next one. Feeds refresh every 15 minutes. A feed that can't be read shows an error at the bottom center, at the size of the FPS counter. Empty plays the original characters. |
 | Direction | Bottom | The characters fly to the top, left, right or bottom (original). They stay upright. |
 | Style | Layered | `Layered` is the original look. `Simple` keeps one sharp layer. |
 | Font | MS Gothic | Font for the characters. Characters it can't draw are skipped. |
