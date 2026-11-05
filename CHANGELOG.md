@@ -5,6 +5,12 @@ All notable changes to this mod are documented in this file. Entries follow
 versions follow [Semantic Versioning](https://semver.org/) with the project
 rule from [AGENTS.md](AGENTS.md): breaking changes bump MINOR, never MAJOR.
 
+## [0.5.0] - 2026-11-05
+
+### Features
+
+- fps: show the frame limit in parentheses in the FPS counter
+
 ## [0.4.0] - 2026-11-05
 
 ### Features

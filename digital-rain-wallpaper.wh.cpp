@@ -2,7 +2,7 @@
 // @id              digital-rain-wallpaper
 // @name            Digital Rain Wallpaper
 // @description     Plays a digital rain animation as the desktop background, rendered with Direct3D 11 behind the desktop icons
-// @version         0.4.0
+// @version         0.5.0
 // @author          radiocity
 // @github          https://github.com/radiocity
 // @license         GPL-3.0
@@ -45,8 +45,9 @@ animation spans all monitors.
 - **Style:** layered (original look) or simple.
 - **Font:** font used for the characters. Characters the font can't draw are
   skipped. The default, MS Gothic, covers the whole set.
-- **Show FPS counter:** shows the frames presented per second, in the rain
-  color and the size of the front rain layer.
+- **Show FPS counter:** shows the frames presented per second and, in
+  parentheses, the frame limit, in the rain color and the size of the front
+  rain layer.
 - **FPS counter position:** top left, top right, bottom left or bottom right
   of the primary monitor's work area.
 
@@ -93,7 +94,7 @@ This mod is licensed under GPL-3.0.
   $name: Pause on battery power
 - showFps: false
   $name: Show FPS counter
-  $description: Shows the frames presented per second, in the rain color and character size.
+  $description: Shows the frames presented per second and, in parentheses, the frame limit, in the rain color and character size.
 - fpsPosition: topRight
   $name: FPS counter position
   $description: Corner of the primary monitor's work area, so the taskbar doesn't hide the counter.
@@ -760,7 +761,10 @@ class RainRenderer {
 
   // Caps the presented frames per second. The animation keeps its speed:
   // steps that come due between frames are drawn together.
-  void SetFrameLimit(int fps) { frame_interval_ms_ = 1000.0 / fps; }
+  void SetFrameLimit(int fps) {
+    frame_limit_ = fps;
+    frame_interval_ms_ = 1000.0 / fps;
+  }
 
   // Restarts the frame clocks, so a long pause doesn't cause a burst of
   // catch-up steps.
@@ -854,6 +858,7 @@ class RainRenderer {
   int fps_frames_ = 0;
   double fps_window_start_ms_ = 0.0;
 
+  int frame_limit_ = kDefaultRefreshRate;
   double frame_interval_ms_ = 1000.0 / kDefaultRefreshRate;
   double last_present_ms_ = 0.0;
 
@@ -1321,13 +1326,14 @@ void RainRenderer::CompositeOverlay(double now_ms) {
   presented_blur_amount_ = blur_amount;
 }
 
-// Draws "FPS: <n>" with the glyphs, color and size of the front rain layer,
-// on a translucent backdrop that keeps it readable over the rain.
+// Draws "FPS: <n> (<limit>)" with the glyphs, color and size of the front
+// rain layer, on a translucent backdrop that keeps it readable over the rain.
 void RainRenderer::DrawFpsCounter() {
   if (!settings_.show_fps || layers_.empty()) return;
   const float font_px = layers_.front().font_px;
   const std::wstring text =
-      L"FPS: " + (fps_ < 0 ? std::wstring(L"--") : std::to_wstring(fps_));
+      L"FPS: " + (fps_ < 0 ? std::wstring(L"--") : std::to_wstring(fps_)) +
+      L" (" + std::to_wstring(frame_limit_) + L")";
 
   // Characters missing from the atlas, like the space, only advance.
   const float missing_advance = 0.5f * font_px;

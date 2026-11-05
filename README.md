@@ -41,7 +41,7 @@ Requires Windows 10 or 11 and a Direct3D 10 capable GPU.
 | Font | MS Gothic | Font for the characters. Characters it can't draw are skipped. |
 | Pause when the desktop is covered | On | Pause while maximized or fullscreen windows cover every monitor. |
 | Pause on battery power | Off | Pause while the computer runs on battery. |
-| Show FPS counter | Off | Show the frames presented per second, in the rain color and the size of the front rain layer. |
+| Show FPS counter | Off | Show the frames presented per second and, in parentheses, the frame limit, in the rain color and the size of the front rain layer. |
 | FPS counter position | Top right | Top left, top right, bottom left or bottom right of the primary monitor's work area, clear of the taskbar. |
 
 ## How it works
