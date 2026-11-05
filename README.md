@@ -37,6 +37,7 @@ Requires Windows 10 or 11 and a Direct3D 10 capable GPU.
 | Speed | 100% | 25% to 400% of the original speed. |
 | Frame limit | 60 FPS | Maximum frames per second, from 24 up to the highest refresh rate of your monitors. `0` uses that refresh rate. The rain keeps its speed at any limit. |
 | Character size | 13% | Size of the largest characters, 1% to 100% of 72 pt. Smaller layers keep their proportions. 13% is the original size. The display DPI scales it further. |
+| Direction | Bottom | The characters fly to the top, left, right or bottom (original). They stay upright. |
 | Style | Layered | `Layered` is the original look. `Simple` keeps one sharp layer. |
 | Font | MS Gothic | Font for the characters. Characters it can't draw are skipped. |
 | Pause when the desktop is covered | On | Pause while maximized or fullscreen windows cover every monitor. |

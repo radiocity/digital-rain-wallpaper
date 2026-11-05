@@ -2,7 +2,7 @@
 // @id              digital-rain-wallpaper
 // @name            Digital Rain Wallpaper
 // @description     Plays a digital rain animation as the desktop background, rendered with Direct3D 11 behind the desktop icons
-// @version         0.5.0
+// @version         0.6.0
 // @author          radiocity
 // @github          https://github.com/radiocity
 // @license         GPL-3.0
@@ -42,6 +42,8 @@ animation spans all monitors.
   refresh rate of your monitors, which the animation spans. 0 uses that
   refresh rate. The rain keeps its speed at any limit. Higher limits make the
   overlay's blur fades smoother.
+- **Direction:** the characters fly to the top, left, right or bottom
+  (original). The characters stay upright.
 - **Style:** layered (original look) or simple.
 - **Font:** font used for the characters. Characters the font can't draw are
   skipped. The default, MS Gothic, covers the whole set.
@@ -79,6 +81,14 @@ This mod is licensed under GPL-3.0.
 - frameLimit: 60
   $name: Frame limit (FPS)
   $description: Maximum frames per second, from 24 up to the highest refresh rate of your monitors. 0 uses that refresh rate. The rain keeps its speed at any limit.
+- direction: bottom
+  $name: Direction
+  $description: Direction the characters fly in. The characters stay upright.
+  $options:
+  - top: Top
+  - left: Left
+  - right: Right
+  - bottom: Bottom (original)
 - style: layered
   $name: Style
   $options:
@@ -363,6 +373,9 @@ struct RenderTexture {
 
 enum class FpsPosition { kTopLeft, kTopRight, kBottomLeft, kBottomRight };
 
+// Where the characters fly to.
+enum class Direction { kTop, kLeft, kRight, kBottom };
+
 struct Settings {
   Color color = {0.0f, 1.0f, 0.0f, 1.0f};
   float speed = 1.0f;
@@ -375,6 +388,7 @@ struct Settings {
   bool pause_on_battery = false;
   bool show_fps = false;
   FpsPosition fps_position = FpsPosition::kTopRight;
+  Direction direction = Direction::kBottom;
 };
 
 enum class FrameResult { kIdle, kPresented, kDeviceLost };
@@ -472,6 +486,16 @@ Settings LoadSettings() {
     settings.fps_position = FpsPosition::kBottomRight;
   }
   Wh_FreeStringSetting(fps_position);
+
+  PCWSTR direction = Wh_GetStringSetting(L"direction");
+  if (wcscmp(direction, L"top") == 0) {
+    settings.direction = Direction::kTop;
+  } else if (wcscmp(direction, L"left") == 0) {
+    settings.direction = Direction::kLeft;
+  } else if (wcscmp(direction, L"right") == 0) {
+    settings.direction = Direction::kRight;
+  }
+  Wh_FreeStringSetting(direction);
   return settings;
 }
 
@@ -794,6 +818,10 @@ class RainRenderer {
   double StepIntervalMs(const RainLayer& layer) const;
   float BlurAmount(double now_ms) const;
   float Random() { return distribution_(random_engine_); }
+  bool IsHorizontal() const {
+    return settings_.direction == Direction::kLeft ||
+           settings_.direction == Direction::kRight;
+  }
   int RandomGlyph();
 
   void StepLayer(RainLayer& layer);
@@ -1087,6 +1115,7 @@ bool RainRenderer::Resize(int width, int height, float dpi_scale,
 bool RainRenderer::ApplySettings(const Settings& settings, double now_ms) {
   const bool layout_changed = settings.font_name != settings_.font_name ||
                               settings.layered != settings_.layered ||
+                              settings.direction != settings_.direction ||
                               settings.font_scale != settings_.font_scale;
   settings_ = settings;
   return EnsureAtlas() && (!layout_changed || ResetAnimation(now_ms));
@@ -1107,7 +1136,9 @@ bool RainRenderer::ResetAnimation(double now_ms) {
     }
     layer.font_px = std::max(
         2.0f, layer.config.font_size * dpi_scale_ * settings_.font_scale);
-    const int columns = std::max(1, static_cast<int>(width_ / layer.font_px));
+    // Columns span the screen across the direction of flight.
+    const int across = IsHorizontal() ? height_ : width_;
+    const int columns = std::max(1, static_cast<int>(across / layer.font_px));
     layer.drops.assign(columns, 0);
     layer.delays.assign(columns, 0.0f);
     if (!CreateRenderTexture(device_.Get(), width_, height_,
@@ -1240,13 +1271,33 @@ void RainRenderer::StepLayer(RainLayer& layer) {
   // Fades the previous frames, which leaves trails behind the drops.
   glyphs_.push_back(atlas_.MakeSolid(0.0f, 0.0f, width_, height_,
                                      {0.0f, 0.0f, 0.0f, kTrailFadeAlpha}));
+  // The original falls down; the other directions mirror or turn the path,
+  // and the glyphs stay upright.
+  const float along_limit = IsHorizontal() ? width_ : height_;
   for (size_t i = 0; i < layer.drops.size(); ++i) {
-    const float x = i * font_px;
-    const float y = layer.drops[i] * font_px;
-    // The original also draws below the canvas; those glyphs are skipped.
-    if (y - 2.0f * font_px < height_) {
-      glyphs_.push_back(
-          atlas_.MakeGlyph(RandomGlyph(), x, y, font_px, settings_.color));
+    const float across = i * font_px;
+    const float along = layer.drops[i] * font_px;
+    // The original also draws past the canvas; those glyphs are skipped.
+    if (along - 2.0f * font_px < along_limit) {
+      float x = across;
+      float baseline = along;
+      switch (settings_.direction) {
+        case Direction::kBottom:
+          break;
+        case Direction::kTop:
+          baseline = height_ - along + font_px;
+          break;
+        case Direction::kRight:
+          x = along - font_px;
+          baseline = across + font_px;
+          break;
+        case Direction::kLeft:
+          x = width_ - along;
+          baseline = across + font_px;
+          break;
+      }
+      glyphs_.push_back(atlas_.MakeGlyph(RandomGlyph(), x, baseline, font_px,
+                                         settings_.color));
     }
 
     if (layer.delays[i] <= 0.0f) {
@@ -1256,7 +1307,7 @@ void RainRenderer::StepLayer(RainLayer& layer) {
       layer.delays[i] -= 1.0f;
     }
 
-    if (y > height_ && Random() > 1.0f - kDropResetChance) {
+    if (along > along_limit && Random() > 1.0f - kDropResetChance) {
       layer.drops[i] = 0;
     }
   }

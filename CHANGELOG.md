@@ -5,6 +5,13 @@ All notable changes to this mod are documented in this file. Entries follow
 versions follow [Semantic Versioning](https://semver.org/) with the project
 rule from [AGENTS.md](AGENTS.md): breaking changes bump MINOR, never MAJOR.
 
+## [0.6.0] - 2026-11-05
+
+### Features
+
+- direction: add a direction setting, so the characters fly to the top,
+  left, right or bottom (original) while staying upright
+
 ## [0.5.0] - 2026-11-05
 
 ### Features
