@@ -5,6 +5,20 @@ All notable changes to this mod are documented in this file. Entries follow
 versions follow [Semantic Versioning](https://semver.org/) with the project
 rule from [AGENTS.md](AGENTS.md): breaking changes bump MINOR, never MAJOR.
 
+## [0.10.0] - 2026-11-05
+
+### Features
+
+- screensaver: add a screensaver inactivity timeout setting, 0 (off) by
+  default. After the timeout without input the rain plays fullscreen above
+  all windows, and any key, click, wheel or mouse movement stops it without
+  reaching the app below
+- screensaver: don't start while a fullscreen game, video or presentation
+  runs, or while the session is locked
+- screensaver: turn the Windows screensaver off while ours is on, for the
+  running session only, and turn it on again when ours is turned off or the
+  mod is disabled
+
 ## [0.9.0] - 2026-11-05
 
 ### Features

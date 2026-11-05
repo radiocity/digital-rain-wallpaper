@@ -18,6 +18,7 @@ working. One animation spans all monitors.
   optionally, on battery power.
 - Optional FPS counter in any corner of the primary monitor.
 - Optional RSS or Atom feeds: the columns spell the feed headlines.
+- Optional screensaver that plays the rain after a time without input.
 - Recovers when Explorer recreates the desktop or the graphics device is lost.
 
 ## Install
@@ -45,6 +46,7 @@ Requires Windows 10 or 11 and a Direct3D 10 capable GPU.
 | Direction | Bottom | The characters fly to the top, left, right or bottom (original). They stay upright. |
 | Style | Layered | `Layered` is the original look. `Simple` keeps one sharp layer. |
 | Font | MS Gothic | Font for the characters. Characters it can't draw are skipped. |
+| Screensaver inactivity timeout | 0 s (off) | Seconds without keyboard or mouse input before the rain plays fullscreen above all windows. While it's on, the Windows screensaver is turned off for the session; it's turned on again at 0 or when the mod is disabled. It doesn't start while a fullscreen game, video or presentation runs. Any key, click, wheel or mouse movement stops it without reaching the app below. |
 | Pause when the desktop is covered | On | Pause while maximized or fullscreen windows cover every monitor. |
 | Pause on battery power | Off | Pause while the computer runs on battery. |
 | Show FPS counter | Off | Show the frames presented per second and, in parentheses, the frame limit, in the rain color and the size of the front rain layer. |

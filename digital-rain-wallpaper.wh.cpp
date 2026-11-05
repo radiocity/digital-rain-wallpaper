@@ -2,12 +2,12 @@
 // @id              digital-rain-wallpaper
 // @name            Digital Rain Wallpaper
 // @description     Plays a digital rain animation as the desktop background, rendered with Direct3D 11 behind the desktop icons
-// @version         0.9.0
+// @version         0.10.0
 // @author          radiocity
 // @github          https://github.com/radiocity
 // @license         GPL-3.0
 // @include         explorer.exe
-// @compilerOptions -ld3d11 -ld3dcompiler_47 -ldxgi -ldwmapi -lgdi32 -lwtsapi32 -lole32 -loleaut32 -lmsxml6 -lshcore -ladvapi32
+// @compilerOptions -ld3d11 -ld3dcompiler_47 -ldxgi -ldwmapi -lgdi32 -lwtsapi32 -lole32 -loleaut32 -lmsxml6 -lshcore -ladvapi32 -lshell32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -31,6 +31,7 @@ animation spans all monitors.
   optionally, on battery power.
 - Optional FPS counter in any corner of the primary monitor.
 - Optional RSS or Atom feeds: the columns spell the feed headlines.
+- Optional screensaver that plays the rain after a time without input.
 
 ## Settings
 
@@ -69,6 +70,13 @@ animation spans all monitors.
   refresh every 15 minutes. A feed that can't be read shows an error at the
   bottom center, at the size of the FPS counter. Empty plays the original
   characters.
+- **Screensaver inactivity timeout:** seconds without keyboard or mouse
+  input before the rain plays fullscreen above all windows and hides the
+  cursor. 0, the default, turns the screensaver off. While it's on, the
+  Windows screensaver is turned off; it's turned on again at 0 or when the
+  mod is disabled. The screensaver doesn't start while a fullscreen app such
+  as a game, a video or a presentation runs. Any key, click, wheel or mouse
+  movement stops it, without reaching the app below.
 
 ## Credits
 
@@ -123,6 +131,9 @@ This mod is licensed under GPL-3.0.
 - fontName: MS Gothic
   $name: Font
   $description: Font for the characters. Characters the font can't draw are skipped.
+- screensaverTimeout: 0
+  $name: Screensaver inactivity timeout (seconds)
+  $description: Seconds without keyboard or mouse input before the rain plays as a fullscreen screensaver, up to 86400. 0 turns the screensaver off. While it's on, the Windows screensaver is off; it comes back at 0 or when the mod is disabled. It doesn't start while a fullscreen app runs, and any input stops it.
 - pauseWhenCovered: true
   $name: Pause when the desktop is covered
   $description: Pause while maximized or fullscreen windows cover every monitor.
@@ -199,6 +210,7 @@ This mod is licensed under GPL-3.0.
 #include <wtsapi32.h>
 #include <ole2.h>
 #include <msxml6.h>
+#include <shellapi.h>
 #include <shellscalingapi.h>
 
 #include <algorithm>
@@ -289,6 +301,13 @@ constexpr float kAtlasMaxLod = 3.0f;
 
 constexpr wchar_t kDefaultFontName[] = L"MS Gothic";
 constexpr wchar_t kWindowClassName[] = L"DigitalRainWallpaper";
+constexpr wchar_t kScreensaverClassName[] = L"DigitalRainScreensaver";
+// Mod storage value set while the Windows screensaver is turned off for
+// ours, so it can be turned on again.
+constexpr wchar_t kWindowsScreensaverOffValue[] = L"windowsScreensaverOff";
+constexpr DWORD kMaxScreensaverTimeoutSeconds = 24 * 60 * 60;
+// Mouse movement the screensaver ignores, in pixels.
+constexpr LONG kScreensaverMouseSlop = 4;
 constexpr UINT kMsgReloadSettings = WM_APP + 1;
 constexpr UINT kMsgFeedsUpdated = WM_APP + 2;
 
@@ -447,6 +466,8 @@ struct Settings {
   Direction direction = Direction::kBottom;
   // One animation across all monitors instead of one per monitor.
   bool seamless = false;
+  // Inactivity before the screensaver starts; 0 turns it off.
+  DWORD screensaver_timeout_ms = 0;
 };
 
 // A monitor's part of the window, and its pixels per CSS pixel (1/96 inch),
@@ -612,6 +633,11 @@ Settings LoadSettings() {
   }
   Wh_FreeStringSetting(direction);
   settings.seamless = Wh_GetIntSetting(L"seamless") != 0;
+  settings.screensaver_timeout_ms =
+      static_cast<DWORD>(std::clamp(Wh_GetIntSetting(L"screensaverTimeout"), 0,
+                                    static_cast<int>(
+                                        kMaxScreensaverTimeoutSeconds))) *
+      1000;
   return settings;
 }
 
@@ -2691,6 +2717,223 @@ bool FeedFetcher::FetchFeed(const std::wstring& link,
   return true;
 }
 
+// Milliseconds since the last keyboard or mouse input in the session.
+DWORD UserIdleMs() {
+  LASTINPUTINFO info = {};
+  info.cbSize = sizeof(info);
+  if (!GetLastInputInfo(&info)) return 0;
+  return GetTickCount() - info.dwTime;
+}
+
+DWORD LastInputTick() {
+  LASTINPUTINFO info = {};
+  info.cbSize = sizeof(info);
+  return GetLastInputInfo(&info) ? info.dwTime : 0;
+}
+
+// Returns true while a fullscreen game, video or presentation runs.
+bool IsFullscreenAppRunning() {
+  QUERY_USER_NOTIFICATION_STATE state = QUNS_ACCEPTS_NOTIFICATIONS;
+  if (SUCCEEDED(SHQueryUserNotificationState(&state)) &&
+      (state == QUNS_BUSY || state == QUNS_RUNNING_D3D_FULL_SCREEN ||
+       state == QUNS_PRESENTATION_MODE)) {
+    return true;
+  }
+  // Borderless fullscreen windows, like a video in a browser, don't always
+  // count as busy.
+  HWND foreground = GetForegroundWindow();
+  if (!foreground || IsDesktopIconsWindow(foreground) || IsZoomed(foreground) ||
+      (GetWindowLongW(foreground, GWL_STYLE) & WS_CAPTION) == WS_CAPTION) {
+    return false;
+  }
+  RECT bounds;
+  MONITORINFO info = {};
+  info.cbSize = sizeof(info);
+  return GetWindowRect(foreground, &bounds) &&
+         GetMonitorInfoW(MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST),
+                         &info) &&
+         ContainsRect(bounds, info.rcMonitor);
+}
+
+// Turns the Windows screensaver off for ours, and remembers that in the mod
+// storage, so it can be turned on again even after Explorer restarts. Only
+// the running session changes, never the user profile, so the user's
+// setting comes back at the next sign-in at the latest.
+void TurnOffWindowsScreensaver() {
+  BOOL active = FALSE;
+  if (!SystemParametersInfoW(SPI_GETSCREENSAVEACTIVE, 0, &active, 0) ||
+      !active) {
+    return;
+  }
+  Wh_SetIntValue(kWindowsScreensaverOffValue, 1);
+  SystemParametersInfoW(SPI_SETSCREENSAVEACTIVE, FALSE, nullptr,
+                        SPIF_SENDCHANGE);
+  Wh_Log(L"Windows screensaver turned off");
+}
+
+void RestoreWindowsScreensaver() {
+  if (!Wh_GetIntValue(kWindowsScreensaverOffValue, 0)) return;
+  SystemParametersInfoW(SPI_SETSCREENSAVEACTIVE, TRUE, nullptr,
+                        SPIF_SENDCHANGE);
+  Wh_DeleteValue(kWindowsScreensaverOffValue);
+  Wh_Log(L"Windows screensaver restored");
+}
+
+// Fullscreen window above all others that plays the rain until the user
+// acts. It takes the focus, so the key or click that stops it doesn't reach
+// the app below.
+class Screensaver {
+ public:
+  Screensaver() = default;
+  Screensaver(const Screensaver&) = delete;
+  Screensaver& operator=(const Screensaver&) = delete;
+  ~Screensaver();
+
+  bool Start(const Settings& settings, const FeedContent& feeds,
+             int frame_limit);
+  // True once any input arrived after the start.
+  bool IsUserActive() const;
+  FrameResult Advance(double now_ms) { return renderer_->Advance(now_ms); }
+  double NextFrameMs(double now_ms) const {
+    return renderer_->NextFrameMs(now_ms);
+  }
+  bool SetFeedContent(const FeedContent& feeds) {
+    return renderer_->SetFeedContent(feeds);
+  }
+
+ private:
+  static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
+                                     LPARAM lparam);
+
+  HWND window_ = nullptr;
+  HWND previous_foreground_ = nullptr;
+  bool class_registered_ = false;
+  std::unique_ptr<RainRenderer> renderer_;
+  DWORD start_input_tick_ = 0;
+  POINT start_cursor_ = {};
+  bool user_active_ = false;
+};
+
+Screensaver::~Screensaver() {
+  renderer_.reset();
+  if (window_) DestroyWindow(window_);
+  if (class_registered_) {
+    UnregisterClassW(kScreensaverClassName, module_instance);
+  }
+  if (previous_foreground_ && IsWindow(previous_foreground_)) {
+    SetForegroundWindow(previous_foreground_);
+  }
+}
+
+bool Screensaver::Start(const Settings& settings, const FeedContent& feeds,
+                        int frame_limit) {
+  WNDCLASSEXW window_class = {};
+  window_class.cbSize = sizeof(window_class);
+  window_class.lpfnWndProc = WindowProc;
+  window_class.hInstance = module_instance;
+  window_class.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+  window_class.lpszClassName = kScreensaverClassName;
+  if (!RegisterClassExW(&window_class) &&
+      GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    Wh_Log(L"RegisterClassExW failed: %lu", GetLastError());
+    return false;
+  }
+  class_registered_ = true;
+
+  const int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  const int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  previous_foreground_ = GetForegroundWindow();
+  window_ = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                            kScreensaverClassName, L"Digital Rain", WS_POPUP,
+                            x, y, width, height, nullptr, nullptr,
+                            module_instance, this);
+  if (!window_) {
+    Wh_Log(L"CreateWindowExW failed: %lu", GetLastError());
+    return false;
+  }
+
+  const double now_ms = NowMs();
+  const UINT dpi = GetDpiForWindow(window_);
+  renderer_ = std::make_unique<RainRenderer>();
+  if (!renderer_->Initialize(window_, width, height, dpi ? dpi / 96.0f : 1.0f,
+                             settings, now_ms) ||
+      !renderer_->SetMonitors(MonitorAreasFor(window_), now_ms)) {
+    return false;
+  }
+  // No taskbar shows over the screensaver, so the counter uses the whole
+  // primary monitor.
+  MONITORINFO info = {};
+  info.cbSize = sizeof(info);
+  if (GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY),
+                      &info)) {
+    RECT area = info.rcMonitor;
+    MapWindowPoints(HWND_DESKTOP, window_, reinterpret_cast<POINT*>(&area),
+                    2);
+    renderer_->SetCounterArea(area);
+  }
+  renderer_->SetFrameLimit(frame_limit);
+  if (!feeds.titles.empty() || !feeds.errors.empty()) {
+    renderer_->SetFeedContent(feeds);
+  }
+
+  start_input_tick_ = LastInputTick();
+  GetCursorPos(&start_cursor_);
+  ShowWindow(window_, SW_SHOW);
+  SetForegroundWindow(window_);
+  return true;
+}
+
+bool Screensaver::IsUserActive() const {
+  return user_active_ || LastInputTick() != start_input_tick_;
+}
+
+LRESULT CALLBACK Screensaver::WindowProc(HWND window, UINT message,
+                                         WPARAM wparam, LPARAM lparam) {
+  if (message == WM_NCCREATE) {
+    const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lparam);
+    SetWindowLongPtrW(window, GWLP_USERDATA,
+                      reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+  }
+  auto* self = reinterpret_cast<Screensaver*>(
+      GetWindowLongPtrW(window, GWLP_USERDATA));
+  switch (message) {
+    case WM_SETCURSOR:
+      SetCursor(nullptr);
+      return TRUE;
+    case WM_MOUSEMOVE: {
+      // Windows sends a move when the window appears; only real movement
+      // counts.
+      POINT cursor;
+      if (self && GetCursorPos(&cursor) &&
+          (std::abs(cursor.x - self->start_cursor_.x) >
+               kScreensaverMouseSlop ||
+           std::abs(cursor.y - self->start_cursor_.y) >
+               kScreensaverMouseSlop)) {
+        self->user_active_ = true;
+      }
+      return 0;
+    }
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_XBUTTONDOWN:
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+    case WM_CLOSE:
+      // Swallowed, so the input doesn't reach the app below.
+      if (self) self->user_active_ = true;
+      return 0;
+    case WM_ACTIVATEAPP:
+      if (!wparam && self) self->user_active_ = true;
+      return 0;
+  }
+  return DefWindowProcW(window, message, wparam, lparam);
+}
+
 // Click-through child window of the wallpaper host, driven by a message loop
 // on the render thread.
 class DesktopWallpaper {
@@ -2722,6 +2965,11 @@ class DesktopWallpaper {
   void UpdateMonitors(bool force);
   void ApplyFrameLimit();
   void ApplyFeedContent();
+  // Turns the Windows screensaver off or on for ours, and starts or stops
+  // ours.
+  void UpdateScreensaver();
+  void StartScreensaver();
+  void StopScreensaver();
 
   HWND host_ = nullptr;
   HWND window_ = nullptr;
@@ -2745,10 +2993,16 @@ class DesktopWallpaper {
   // Monitor rectangles on screen, to notice layout changes cheaply.
   std::vector<RECT> monitor_rects_;
   std::vector<MonitorArea> monitor_areas_;
+  std::unique_ptr<Screensaver> screensaver_;
+  // Input time when the screensaver last failed to start, so it isn't
+  // retried before the next input.
+  DWORD screensaver_failed_tick_ = 0;
 };
 
 DesktopWallpaper::~DesktopWallpaper() {
   destroying_ = true;
+  screensaver_.reset();
+  RestoreWindowsScreensaver();
   // Waits for a download in progress to abort, about a second at most.
   feed_fetcher_.reset();
   renderer_.reset();
@@ -2909,6 +3163,7 @@ LRESULT DesktopWallpaper::HandleMessage(HWND window, UINT message,
     case WM_WTSSESSION_CHANGE:
       if (wparam == WTS_SESSION_LOCK) {
         session_locked_ = true;
+        if (screensaver_) StopScreensaver();
       } else if (wparam == WTS_SESSION_UNLOCK) {
         session_locked_ = false;
       }
@@ -2946,10 +3201,27 @@ void DesktopWallpaper::ApplyFeedContent() {
   if (renderer_ && !renderer_->SetFeedContent(feed_content_)) {
     renderer_.reset();
   }
-  if (!paused_) ScheduleFrame(0.0);
+  if (screensaver_ && !screensaver_->SetFeedContent(feed_content_)) {
+    StopScreensaver();
+  }
+  if (!paused_ || screensaver_) ScheduleFrame(0.0);
 }
 
 void DesktopWallpaper::RenderFrame() {
+  // The screensaver covers the wallpaper, which waits meanwhile.
+  if (screensaver_) {
+    if (screensaver_->IsUserActive()) {
+      StopScreensaver();
+      return;
+    }
+    const double now_ms = NowMs();
+    if (screensaver_->Advance(now_ms) == FrameResult::kDeviceLost) {
+      StopScreensaver();
+      return;
+    }
+    ScheduleFrame(screensaver_->NextFrameMs(now_ms) - NowMs());
+    return;
+  }
   if (paused_) return;
   if (!renderer_ && !CreateRenderer()) {
     ScheduleFrame(kRetryDelayMs);
@@ -2979,6 +3251,8 @@ void DesktopWallpaper::ScheduleFrame(double delay_ms) {
 }
 
 void DesktopWallpaper::ReloadSettings() {
+  // The screensaver restarts with the new settings after the next timeout.
+  if (screensaver_) StopScreensaver();
   settings_ = LoadSettings();
   if (renderer_ && !renderer_->ApplySettings(settings_, NowMs())) {
     renderer_.reset();
@@ -3029,12 +3303,61 @@ void DesktopWallpaper::CheckHost() {
 }
 
 void DesktopWallpaper::UpdatePauseState() {
+  UpdateScreensaver();
   const bool pause = session_locked_ ||
                      (settings_.pause_on_battery && IsOnBattery()) ||
                      (settings_.pause_when_covered && IsDesktopCovered());
   if (pause == paused_) return;
   paused_ = pause;
   Wh_Log(L"%s", paused_ ? L"Paused" : L"Resumed");
+  if (screensaver_) return;
+  if (paused_) {
+    CancelWaitableTimer(frame_timer_);
+    return;
+  }
+  if (renderer_) renderer_->Resume(NowMs());
+  ScheduleFrame(0.0);
+}
+
+void DesktopWallpaper::UpdateScreensaver() {
+  if (settings_.screensaver_timeout_ms == 0) {
+    if (screensaver_) StopScreensaver();
+    RestoreWindowsScreensaver();
+    return;
+  }
+  // Checked every time, so turning it on again in the Windows settings
+  // doesn't make two screensavers.
+  TurnOffWindowsScreensaver();
+  if (screensaver_) {
+    if (screensaver_->IsUserActive()) StopScreensaver();
+    return;
+  }
+  if (session_locked_ || UserIdleMs() < settings_.screensaver_timeout_ms ||
+      LastInputTick() == screensaver_failed_tick_ ||
+      IsFullscreenAppRunning()) {
+    return;
+  }
+  StartScreensaver();
+}
+
+void DesktopWallpaper::StartScreensaver() {
+  auto screensaver = std::make_unique<Screensaver>();
+  if (!screensaver->Start(
+          settings_, feed_content_,
+          EffectiveFrameLimit(settings_.frame_limit, settings_.seamless))) {
+    Wh_Log(L"Starting the screensaver failed");
+    screensaver_failed_tick_ = LastInputTick();
+    return;
+  }
+  Wh_Log(L"Screensaver started after %lu s without input",
+         static_cast<unsigned long>(UserIdleMs() / 1000));
+  screensaver_ = std::move(screensaver);
+  ScheduleFrame(0.0);
+}
+
+void DesktopWallpaper::StopScreensaver() {
+  screensaver_.reset();
+  Wh_Log(L"Screensaver stopped");
   if (paused_) {
     CancelWaitableTimer(frame_timer_);
     return;
