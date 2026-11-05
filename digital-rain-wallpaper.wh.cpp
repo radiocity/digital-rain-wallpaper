@@ -2,7 +2,7 @@
 // @id              digital-rain-wallpaper
 // @name            Digital Rain Wallpaper
 // @description     Plays a digital rain animation as the desktop background, rendered with Direct3D 11 behind the desktop icons
-// @version         0.7.0
+// @version         0.8.0
 // @author          radiocity
 // @github          https://github.com/radiocity
 // @license         GPL-3.0
@@ -34,7 +34,11 @@ animation spans all monitors.
 
 ## Settings
 
-- **Rain color:** `#RGB` or `#RRGGBB`, green by default.
+- **Rain color:** `#RGB` or `#RRGGBB`, green by default. Several colors
+  separated by commas or semicolons, like `#00FF00, #00CCFF; #FF2266`, change
+  linearly from one to the next and back to the first.
+- **Color change time:** seconds each change from one color to the next
+  takes, 60 by default.
 - **Speed:** 25% to 400% of the original speed.
 - **Character size:** size of the largest characters, from 1% to 100% of
   72 pt. Smaller layers keep their proportions. 13% is the original size. The
@@ -79,7 +83,10 @@ This mod is licensed under GPL-3.0.
 /*
 - color: "#00FF00"
   $name: Rain color
-  $description: Color of the falling characters, as #RGB or #RRGGBB.
+  $description: Color of the falling characters, as #RGB or #RRGGBB. Several colors separated by commas or semicolons change linearly from one to the next, for example #00FF00, #00CCFF; #FF2266.
+- colorSeconds: 60
+  $name: Color change time (seconds)
+  $description: Seconds each change from one rain color to the next takes, from 1 to 3600. Used with several colors.
 - speed: 100
   $name: Speed (%)
   $description: Animation speed relative to the original, from 25 to 400.
@@ -186,6 +193,7 @@ This mod is licensed under GPL-3.0.
 #include <msxml6.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -412,7 +420,9 @@ enum class FpsPosition { kTopLeft, kTopRight, kBottomLeft, kBottomRight };
 enum class Direction { kTop, kLeft, kRight, kBottom };
 
 struct Settings {
-  Color color = {0.0f, 1.0f, 0.0f, 1.0f};
+  // One color, or several the rain moves through.
+  std::vector<Color> colors = {{0.0f, 1.0f, 0.0f, 1.0f}};
+  double color_transition_ms = 60000.0;
   float speed = 1.0f;
   // Requested limit; 0 means the highest monitor refresh rate.
   int frame_limit = kDefaultRefreshRate;
@@ -486,16 +496,55 @@ std::optional<Color> ParseHexColor(const wchar_t* text) {
   return Color{channels[0], channels[1], channels[2], 1.0f};
 }
 
+// Parses colors separated by commas or semicolons. Invalid ones are skipped.
+std::vector<Color> ParseHexColors(const std::wstring& text) {
+  std::vector<Color> colors;
+  size_t begin = 0;
+  while (begin <= text.size()) {
+    size_t end = text.find_first_of(L",;", begin);
+    if (end == std::wstring::npos) end = text.size();
+    const std::wstring entry = text.substr(begin, end - begin);
+    if (entry.find_first_not_of(L" \t") != std::wstring::npos) {
+      if (std::optional<Color> color = ParseHexColor(entry.c_str())) {
+        colors.push_back(*color);
+      } else {
+        Wh_Log(L"Invalid color \"%s\" skipped", entry.c_str());
+      }
+    }
+    begin = end + 1;
+  }
+  return colors;
+}
+
+// Moves linearly from each color to the next, transition_ms per change, and
+// from the last back to the first.
+Color CycleColor(const std::vector<Color>& colors, double elapsed_ms,
+                 double transition_ms) {
+  if (colors.size() == 1) return colors.front();
+  const double position =
+      std::fmod(std::max(0.0, elapsed_ms) / transition_ms,
+                static_cast<double>(colors.size()));
+  const size_t index = static_cast<size_t>(position) % colors.size();
+  const float t = static_cast<float>(position - std::floor(position));
+  const Color& from = colors[index];
+  const Color& to = colors[(index + 1) % colors.size()];
+  return {from.r + (to.r - from.r) * t, from.g + (to.g - from.g) * t,
+          from.b + (to.b - from.b) * t, 1.0f};
+}
+
 Settings LoadSettings() {
   Settings settings;
 
   PCWSTR color = Wh_GetStringSetting(L"color");
-  if (std::optional<Color> parsed = ParseHexColor(color)) {
-    settings.color = *parsed;
+  std::vector<Color> colors = ParseHexColors(color);
+  if (!colors.empty()) {
+    settings.colors = std::move(colors);
   } else {
-    Wh_Log(L"Invalid color \"%s\", using the default", color);
+    Wh_Log(L"No valid color in \"%s\", using the default", color);
   }
   Wh_FreeStringSetting(color);
+  settings.color_transition_ms =
+      std::clamp(Wh_GetIntSetting(L"colorSeconds"), 1, 3600) * 1000.0;
 
   settings.speed = std::clamp(Wh_GetIntSetting(L"speed"), 25, 400) / 100.0f;
   settings.frame_limit = std::max(0, Wh_GetIntSetting(L"frameLimit"));
@@ -1036,6 +1085,11 @@ class RainRenderer {
   int next_title_ = 0;
   bool content_changed_ = false;
 
+  // The rain color now, on its way through settings_.colors since
+  // color_start_ms_.
+  Color current_color_ = {0.0f, 1.0f, 0.0f, 1.0f};
+  double color_start_ms_ = 0.0;
+
   int frame_limit_ = kDefaultRefreshRate;
   double frame_interval_ms_ = 1000.0 / kDefaultRefreshRate;
   double last_present_ms_ = 0.0;
@@ -1057,6 +1111,8 @@ bool RainRenderer::Initialize(HWND window, int width, int height,
   dpi_scale_ = dpi_scale;
   settings_ = settings;
   counter_area_ = {0, 0, width_, height_};
+  color_start_ms_ = now_ms;
+  current_color_ = settings_.colors.front();
   return CreateDevice() && EnsureAtlas() && CreateTargets() &&
          ResetAnimation(now_ms);
 }
@@ -1331,7 +1387,19 @@ bool RainRenderer::ApplySettings(const Settings& settings, double now_ms) {
                               settings.layered != settings_.layered ||
                               settings.direction != settings_.direction ||
                               settings.font_scale != settings_.font_scale;
+  // New colors start over from the first one.
+  const bool colors_changed =
+      settings.colors.size() != settings_.colors.size() ||
+      !std::equal(settings.colors.begin(), settings.colors.end(),
+                  settings_.colors.begin(),
+                  [](const Color& a, const Color& b) {
+                    return a.r == b.r && a.g == b.g && a.b == b.b;
+                  });
   settings_ = settings;
+  if (colors_changed) {
+    color_start_ms_ = now_ms;
+    current_color_ = settings_.colors.front();
+  }
   return EnsureAtlas() && (!layout_changed || ResetAnimation(now_ms));
 }
 
@@ -1415,6 +1483,8 @@ FrameResult RainRenderer::Advance(double now_ms) {
     return FrameResult::kIdle;
   }
 
+  current_color_ = CycleColor(settings_.colors, now_ms - color_start_ms_,
+                              settings_.color_transition_ms);
   bool dirty = false;
   for (RainLayer& layer : layers_) {
     const double interval = StepIntervalMs(layer);
@@ -1537,7 +1607,7 @@ void RainRenderer::StepLayer(RainLayer& layer) {
           break;
       }
       glyphs_.push_back(
-          atlas_.MakeGlyph(glyph, x, baseline, font_px, settings_.color));
+          atlas_.MakeGlyph(glyph, x, baseline, font_px, current_color_));
     }
 
     if (layer.delays[i] <= 0.0f) {
@@ -1713,7 +1783,7 @@ void RainRenderer::AppendText(const std::wstring& text, float left,
       continue;
     }
     glyphs_.push_back(atlas_.MakeGlyph(found->second, x, baseline, font_px,
-                                       settings_.color));
+                                       current_color_));
     x += atlas_.AdvancePx(found->second, font_px);
   }
 }

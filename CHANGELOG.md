@@ -5,6 +5,14 @@ All notable changes to this mod are documented in this file. Entries follow
 versions follow [Semantic Versioning](https://semver.org/) with the project
 rule from [AGENTS.md](AGENTS.md): breaking changes bump MINOR, never MAJOR.
 
+## [0.8.0] - 2026-11-05
+
+### Features
+
+- color: accept several rain colors separated by commas or semicolons, which
+  change linearly from one to the next and back to the first
+- color: add a color change time setting, 60 seconds by default
+
 ## [0.7.0] - 2026-11-05
 
 ### Features
