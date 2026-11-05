@@ -2,12 +2,12 @@
 // @id              digital-rain-wallpaper
 // @name            Digital Rain Wallpaper
 // @description     Plays a digital rain animation as the desktop background, rendered with Direct3D 11 behind the desktop icons
-// @version         0.8.0
+// @version         0.8.1
 // @author          radiocity
 // @github          https://github.com/radiocity
 // @license         GPL-3.0
 // @include         explorer.exe
-// @compilerOptions -ld3d11 -ld3dcompiler_47 -ldxgi -ldwmapi -lgdi32 -lwtsapi32 -lole32 -loleaut32 -lmsxml6
+// @compilerOptions -ld3d11 -ld3dcompiler_47 -ldxgi -ldwmapi -lgdi32 -lwtsapi32 -lole32 -loleaut32 -lmsxml6 -lshcore -ladvapi32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -41,8 +41,9 @@ animation spans all monitors.
   takes, 60 by default.
 - **Speed:** 25% to 400% of the original speed.
 - **Character size:** size of the largest characters, from 1% to 100% of
-  72 pt. Smaller layers keep their proportions. 13% is the original size. The
-  display DPI scales it further.
+  72 pt (one inch). Smaller layers keep their proportions. 13% is the original
+  size. Characters have the same physical size on every monitor, measured
+  from the size the monitor reports, or its display scale if it reports none.
 - **Frame limit:** maximum frames per second, from 24 up to the highest
   refresh rate of your monitors, which the animation spans. 0 uses that
   refresh rate. The rain keeps its speed at any limit. Higher limits make the
@@ -92,7 +93,7 @@ This mod is licensed under GPL-3.0.
   $description: Animation speed relative to the original, from 25 to 400.
 - fontSize: 13
   $name: Character size (%)
-  $description: Size of the largest characters, from 1 to 100 percent of 72 pt. Smaller layers keep their proportions. 13 is the original size. The display DPI scales it further.
+  $description: Size of the largest characters, from 1 to 100 percent of 72 pt. Smaller layers keep their proportions. 13 is the original size. Characters have the same physical size on every monitor.
 - frameLimit: 60
   $name: Frame limit (FPS)
   $description: Maximum frames per second, from 24 up to the highest refresh rate of your monitors. 0 uses that refresh rate. The rain keeps its speed at any limit.
@@ -191,6 +192,7 @@ This mod is licensed under GPL-3.0.
 #include <wtsapi32.h>
 #include <ole2.h>
 #include <msxml6.h>
+#include <shellscalingapi.h>
 
 #include <algorithm>
 #include <cmath>
@@ -198,6 +200,7 @@ This mod is licensed under GPL-3.0.
 #include <cstring>
 #include <cwchar>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -435,6 +438,13 @@ struct Settings {
   bool show_fps = false;
   FpsPosition fps_position = FpsPosition::kTopRight;
   Direction direction = Direction::kBottom;
+};
+
+// A monitor's part of the window, and its pixels per CSS pixel (1/96 inch),
+// so characters have the same physical size on every monitor.
+struct MonitorArea {
+  RECT rect;
+  float scale;
 };
 
 // Headlines read from the feeds, and one message per feed that failed.
@@ -953,6 +963,10 @@ class RainRenderer {
   // to the whole window.
   void SetCounterArea(const RECT& area) { counter_area_ = area; }
 
+  // Sizes the characters on each monitor by its own scale. Without
+  // monitors, the whole window uses the DPI scale.
+  bool SetMonitors(const std::vector<MonitorArea>& monitors, double now_ms);
+
   // Caps the presented frames per second. The animation keeps its speed:
   // steps that come due between frames are drawn together.
   void SetFrameLimit(int fps) {
@@ -975,10 +989,19 @@ class RainRenderer {
   double NextFrameMs(double now_ms) const;
 
  private:
+  // The columns of one layer on one monitor.
+  struct RainRegion {
+    RECT rect;
+    float font_px;
+    size_t first_column;
+    size_t column_count;
+  };
+
   struct RainLayer {
     RainLayerConfig config;
     RenderTexture texture;
-    float font_px = 0.0f;
+    std::vector<RainRegion> regions;
+    // One entry per column, region after region.
     std::vector<int> drops;
     std::vector<float> delays;
     // With feed titles: the title each column spells and the position of
@@ -991,6 +1014,11 @@ class RainRenderer {
   bool CreateDevice();
   void BindSharedState();
   bool EnsureAtlas();
+  void UpdateAreas();
+  // The monitor area containing a point, or the nearest one.
+  const MonitorArea& AreaAt(float x, float y) const;
+  // Size of the front layer's characters, used for text.
+  float TextFontPx() const;
   bool CreateTargets();
   bool ResetAnimation(double now_ms);
   double StepIntervalMs(const RainLayer& layer) const;
@@ -1003,6 +1031,8 @@ class RainRenderer {
   int RandomGlyph();
 
   void StepLayer(RainLayer& layer);
+  // Steps the region's columns and adds their glyphs to glyphs_.
+  void StepRegion(RainLayer& layer, const RainRegion& region);
   void BlinkOverlay();
   void Composite(double now_ms);
   void CompositeOverlay(double now_ms);
@@ -1020,7 +1050,9 @@ class RainRenderer {
   void CountPresentedFrame(double now_ms);
   void Blur(ID3D11ShaderResourceView* source);
 
+  // Also resets the scissor rectangle to the whole target.
   void SetTarget(ID3D11RenderTargetView* target, int width, int height);
+  void SetScissor(const RECT& rect);
   void UploadConstants();
   bool EnsureInstanceCapacity(size_t count);
   void DrawGlyphs(const std::vector<GlyphInstance>& glyphs,
@@ -1034,6 +1066,10 @@ class RainRenderer {
   int height_ = 0;
   float dpi_scale_ = 1.0f;
   Settings settings_;
+  std::vector<MonitorArea> monitors_;
+  // monitors_ clipped to the window, or the whole window at dpi_scale_.
+  std::vector<MonitorArea> areas_;
+  float max_scale_ = 1.0f;
 
   ComPtr<ID3D11Device> device_;
   ComPtr<ID3D11DeviceContext> context_;
@@ -1113,13 +1149,67 @@ bool RainRenderer::Initialize(HWND window, int width, int height,
   counter_area_ = {0, 0, width_, height_};
   color_start_ms_ = now_ms;
   current_color_ = settings_.colors.front();
+  UpdateAreas();
   return CreateDevice() && EnsureAtlas() && CreateTargets() &&
          ResetAnimation(now_ms);
 }
 
+bool RainRenderer::SetMonitors(const std::vector<MonitorArea>& monitors,
+                               double now_ms) {
+  const bool same =
+      monitors.size() == monitors_.size() &&
+      std::equal(monitors.begin(), monitors.end(), monitors_.begin(),
+                 [](const MonitorArea& a, const MonitorArea& b) {
+                   return EqualRect(&a.rect, &b.rect) && a.scale == b.scale;
+                 });
+  if (same) return true;
+  monitors_ = monitors;
+  UpdateAreas();
+  return EnsureAtlas() && ResetAnimation(now_ms);
+}
+
+void RainRenderer::UpdateAreas() {
+  const RECT window = {0, 0, width_, height_};
+  areas_.clear();
+  for (const MonitorArea& monitor : monitors_) {
+    RECT visible;
+    if (IntersectRect(&visible, &monitor.rect, &window)) {
+      areas_.push_back({visible, monitor.scale});
+    }
+  }
+  if (areas_.empty()) areas_.push_back({window, dpi_scale_});
+  max_scale_ = 0.0f;
+  for (const MonitorArea& area : areas_) {
+    max_scale_ = std::max(max_scale_, area.scale);
+  }
+}
+
+const MonitorArea& RainRenderer::AreaAt(float x, float y) const {
+  const MonitorArea* nearest = &areas_.front();
+  float nearest_distance = std::numeric_limits<float>::max();
+  for (const MonitorArea& area : areas_) {
+    const float dx = std::max({area.rect.left - x, 0.0f, x - area.rect.right});
+    const float dy = std::max({area.rect.top - y, 0.0f, y - area.rect.bottom});
+    const float distance = dx * dx + dy * dy;
+    if (distance < nearest_distance) {
+      nearest = &area;
+      nearest_distance = distance;
+    }
+  }
+  return *nearest;
+}
+
+float RainRenderer::TextFontPx() const {
+  const MonitorArea& area =
+      AreaAt((counter_area_.left + counter_area_.right) / 2.0f,
+             (counter_area_.top + counter_area_.bottom) / 2.0f);
+  return std::max(2.0f, kRainLayers[0].font_size * area.scale *
+                            settings_.font_scale);
+}
+
 bool RainRenderer::EnsureAtlas() {
   const int em = std::clamp(
-      static_cast<int>(kLargestFontSize * dpi_scale_ * settings_.font_scale +
+      static_cast<int>(kLargestFontSize * max_scale_ * settings_.font_scale +
                        0.5f),
       kMinAtlasEm, kMaxAtlasEm);
   if (atlas_.view() && atlas_.requested_em() == em &&
@@ -1268,6 +1358,8 @@ bool RainRenderer::CreateDevice() {
   rasterizer_desc.FillMode = D3D11_FILL_SOLID;
   rasterizer_desc.CullMode = D3D11_CULL_NONE;
   rasterizer_desc.DepthClipEnable = TRUE;
+  // Keeps each monitor's columns within the monitor.
+  rasterizer_desc.ScissorEnable = TRUE;
 
   D3D11_BLEND_DESC blend_desc = {};
   D3D11_RENDER_TARGET_BLEND_DESC& blend = blend_desc.RenderTarget[0];
@@ -1379,6 +1471,7 @@ bool RainRenderer::Resize(int width, int height, float dpi_scale,
     return false;
   }
   BindSharedState();
+  UpdateAreas();
   return EnsureAtlas() && CreateTargets() && ResetAnimation(now_ms);
 }
 
@@ -1416,16 +1509,27 @@ bool RainRenderer::ResetAnimation(double now_ms) {
       layer.config.opacity = 1.0f;
       layer.config.blurred = false;
     }
-    layer.font_px = std::max(
-        2.0f, layer.config.font_size * dpi_scale_ * settings_.font_scale);
-    // Columns span the screen across the direction of flight.
-    const int across = IsHorizontal() ? height_ : width_;
-    const int columns = std::max(1, static_cast<int>(across / layer.font_px));
+    // Each monitor has its own columns, sized by its scale. They span the
+    // monitor across the direction of flight.
+    size_t columns = 0;
+    for (const MonitorArea& area : areas_) {
+      RainRegion region;
+      region.rect = area.rect;
+      region.font_px = std::max(
+          2.0f, layer.config.font_size * area.scale * settings_.font_scale);
+      const LONG across = IsHorizontal() ? area.rect.bottom - area.rect.top
+                                         : area.rect.right - area.rect.left;
+      region.first_column = columns;
+      region.column_count =
+          std::max<size_t>(1, static_cast<size_t>(across / region.font_px));
+      columns += region.column_count;
+      layer.regions.push_back(region);
+    }
     layer.drops.assign(columns, 0);
     layer.delays.assign(columns, 0.0f);
     layer.column_titles.assign(columns, -1);
     layer.column_offsets.assign(columns, -1);
-    for (int column = 0; column < columns; ++column) {
+    for (size_t column = 0; column < columns; ++column) {
       AssignTitle(layer, column);
     }
     if (!CreateRenderTexture(device_.Get(), width_, height_,
@@ -1560,19 +1664,35 @@ double RainRenderer::NextFrameMs(double now_ms) const {
 
 // One frame of matrixRain() in the original.
 void RainRenderer::StepLayer(RainLayer& layer) {
-  const RainLayerConfig& config = layer.config;
-  const float font_px = layer.font_px;
-
+  SetTarget(layer.texture.target.Get(), width_, height_);
   glyphs_.clear();
   // Fades the previous frames, which leaves trails behind the drops.
   glyphs_.push_back(atlas_.MakeSolid(0.0f, 0.0f, width_, height_,
                                      {0.0f, 0.0f, 0.0f, kTrailFadeAlpha}));
+  DrawGlyphs(glyphs_, straight_blend_.Get());
+
+  for (const RainRegion& region : layer.regions) {
+    glyphs_.clear();
+    StepRegion(layer, region);
+    // Glyphs at the monitor's edge would spill onto its neighbor.
+    SetScissor(region.rect);
+    DrawGlyphs(glyphs_, straight_blend_.Get());
+  }
+  SetScissor({0, 0, width_, height_});
+}
+
+void RainRenderer::StepRegion(RainLayer& layer, const RainRegion& region) {
+  const RainLayerConfig& config = layer.config;
+  const float font_px = region.font_px;
+  const RECT& rect = region.rect;
   // The original falls down; the other directions mirror or turn the path,
   // and the glyphs stay upright.
-  const float along_limit = IsHorizontal() ? width_ : height_;
+  const float along_limit =
+      IsHorizontal() ? rect.right - rect.left : rect.bottom - rect.top;
   const bool spell_titles = !title_glyphs_.empty();
-  for (size_t i = 0; i < layer.drops.size(); ++i) {
-    const float across = i * font_px;
+  for (size_t i = region.first_column;
+       i < region.first_column + region.column_count; ++i) {
+    const float across = (i - region.first_column) * font_px;
     const float along = layer.drops[i] * font_px;
 
     // Titles leave their spaces and the gap between them empty.
@@ -1589,21 +1709,21 @@ void RainRenderer::StepLayer(RainLayer& layer) {
 
     // The original also draws past the canvas; those glyphs are skipped.
     if (glyph >= 0 && along - 2.0f * font_px < along_limit) {
-      float x = across;
-      float baseline = along;
+      float x = rect.left + across;
+      float baseline = rect.top + along;
       switch (settings_.direction) {
         case Direction::kBottom:
           break;
         case Direction::kTop:
-          baseline = height_ - along + font_px;
+          baseline = rect.bottom - along + font_px;
           break;
         case Direction::kRight:
-          x = along - font_px;
-          baseline = across + font_px;
+          x = rect.left + along - font_px;
+          baseline = rect.top + across + font_px;
           break;
         case Direction::kLeft:
-          x = width_ - along;
-          baseline = across + font_px;
+          x = rect.right - along;
+          baseline = rect.top + across + font_px;
           break;
       }
       glyphs_.push_back(
@@ -1630,20 +1750,18 @@ void RainRenderer::StepLayer(RainLayer& layer) {
       if (spell_titles) AssignTitle(layer, i);
     }
   }
-
-  SetTarget(layer.texture.target.Get(), width_, height_);
-  DrawGlyphs(glyphs_, straight_blend_.Get());
 }
 
 // One blink of matrixOverlay() in the original.
 void RainRenderer::BlinkOverlay() {
-  const float font_px = kOverlayFontSize * dpi_scale_ * settings_.font_scale;
   const Color color = {1.0f, 1.0f, 1.0f, kOverlayGlyphAlpha};
   overlay_glyphs_.clear();
   for (int i = 0; i < kOverlayGlyphCount; ++i) {
     const int glyph = RandomGlyph();
     const float x = Random() * width_;
     const float y = Random() * height_;
+    const float font_px =
+        kOverlayFontSize * AreaAt(x, y).scale * settings_.font_scale;
     overlay_glyphs_.push_back(atlas_.MakeGlyph(glyph, x, y, font_px, color));
   }
 
@@ -1701,7 +1819,7 @@ void RainRenderer::CompositeOverlay(double now_ms) {
 // rain layer, on a translucent backdrop that keeps it readable over the rain.
 void RainRenderer::DrawFpsCounter() {
   if (!settings_.show_fps || layers_.empty()) return;
-  const float font_px = layers_.front().font_px;
+  const float font_px = TextFontPx();
   const std::wstring text =
       L"FPS: " + (fps_ < 0 ? std::wstring(L"--") : std::to_wstring(fps_)) +
       L" (" + std::to_wstring(frame_limit_) + L")";
@@ -1730,7 +1848,7 @@ void RainRenderer::DrawFpsCounter() {
 // at the size of the FPS counter.
 void RainRenderer::DrawFeedErrors() {
   if (feed_errors_.empty() || layers_.empty()) return;
-  const float font_px = layers_.front().font_px;
+  const float font_px = TextFontPx();
   std::vector<std::wstring> lines(
       feed_errors_.begin(),
       feed_errors_.begin() +
@@ -1826,6 +1944,11 @@ void RainRenderer::SetTarget(ID3D11RenderTargetView* target, int width,
       0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height),
       0.0f, 1.0f};
   context_->RSSetViewports(1, &viewport);
+  SetScissor({0, 0, width, height});
+}
+
+void RainRenderer::SetScissor(const RECT& rect) {
+  context_->RSSetScissorRects(1, &rect);
 }
 
 void RainRenderer::UploadConstants() {
@@ -2050,6 +2173,139 @@ int EffectiveFrameLimit(int requested) {
   const int monitor_max = MaxMonitorRefreshRate();
   const int limit = requested <= 0 ? monitor_max : requested;
   return std::max(kMinFrameLimit, std::min(limit, monitor_max));
+}
+
+// Reads a monitor's physical size from its EDID, in millimeters, as the
+// monitor reports it in landscape.
+std::optional<SIZE> MonitorSizeMm(const wchar_t* gdi_device_name) {
+  UINT32 path_count = 0;
+  UINT32 mode_count = 0;
+  if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count,
+                                  &mode_count) != ERROR_SUCCESS) {
+    return std::nullopt;
+  }
+  std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+  std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
+  if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(),
+                         &mode_count, modes.data(),
+                         nullptr) != ERROR_SUCCESS) {
+    return std::nullopt;
+  }
+  for (UINT32 i = 0; i < path_count; ++i) {
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME source = {};
+    source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+    source.header.size = sizeof(source);
+    source.header.adapterId = paths[i].sourceInfo.adapterId;
+    source.header.id = paths[i].sourceInfo.id;
+    if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
+        wcscmp(source.viewGdiDeviceName, gdi_device_name) != 0) {
+      continue;
+    }
+    DISPLAYCONFIG_TARGET_DEVICE_NAME target = {};
+    target.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    target.header.size = sizeof(target);
+    target.header.adapterId = paths[i].targetInfo.adapterId;
+    target.header.id = paths[i].targetInfo.id;
+    if (DisplayConfigGetDeviceInfo(&target.header) != ERROR_SUCCESS) {
+      return std::nullopt;
+    }
+
+    // The device path is \\?\DISPLAY#<model>#<instance>#{<interface>}, and
+    // the EDID is under the matching Enum\DISPLAY\<model>\<instance> key.
+    const std::wstring path = target.monitorDevicePath;
+    const size_t model = path.find(L"DISPLAY#");
+    if (model == std::wstring::npos) return std::nullopt;
+    const size_t instance = path.find(L'#', model + 8);
+    const size_t interface_start = path.find(L'#', instance + 1);
+    if (instance == std::wstring::npos ||
+        interface_start == std::wstring::npos) {
+      return std::nullopt;
+    }
+    const std::wstring key =
+        L"SYSTEM\\CurrentControlSet\\Enum\\DISPLAY\\" +
+        path.substr(model + 8, instance - model - 8) + L"\\" +
+        path.substr(instance + 1, interface_start - instance - 1) +
+        L"\\Device Parameters";
+    // Extension blocks make EDIDs longer than the 128-byte base block.
+    std::vector<BYTE> edid(4096);
+    DWORD size = static_cast<DWORD>(edid.size());
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, key.c_str(), L"EDID",
+                     RRF_RT_REG_BINARY, nullptr, edid.data(),
+                     &size) != ERROR_SUCCESS ||
+        size < 128) {
+      return std::nullopt;
+    }
+    // The first detailed timing has millimeters; the basic block only has
+    // centimeters.
+    LONG width = edid[66] | ((edid[68] >> 4) << 8);
+    LONG height = edid[67] | ((edid[68] & 0x0F) << 8);
+    if (width == 0 || height == 0) {
+      width = edid[21] * 10;
+      height = edid[22] * 10;
+    }
+    if (width == 0 || height == 0) return std::nullopt;
+    return SIZE{width, height};
+  }
+  return std::nullopt;
+}
+
+// Pixels per CSS pixel (1/96 inch) on the monitor, from its physical size.
+// Falls back to the Windows display scale when the monitor doesn't report
+// a plausible size, like many projectors.
+float MonitorScale(HMONITOR monitor, const MONITORINFOEXW& info,
+                   bool* physical) {
+  const LONG width = info.rcMonitor.right - info.rcMonitor.left;
+  const LONG height = info.rcMonitor.bottom - info.rcMonitor.top;
+  if (std::optional<SIZE> size_mm = MonitorSizeMm(info.szDevice)) {
+    // A monitor turned to portrait still reports its landscape size.
+    if ((width > height) != (size_mm->cx > size_mm->cy)) {
+      std::swap(size_mm->cx, size_mm->cy);
+    }
+    const float pixels_per_inch =
+        (width * 25.4f / size_mm->cx + height * 25.4f / size_mm->cy) / 2.0f;
+    if (pixels_per_inch >= 20.0f && pixels_per_inch <= 1000.0f) {
+      *physical = true;
+      return pixels_per_inch / 96.0f;
+    }
+  }
+  *physical = false;
+  UINT dpi_x = 0;
+  UINT dpi_y = 0;
+  if (SUCCEEDED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y)) &&
+      dpi_x > 0) {
+    return dpi_x / 96.0f;
+  }
+  return 1.0f;
+}
+
+BOOL CALLBACK CollectMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM param) {
+  reinterpret_cast<std::vector<HMONITOR>*>(param)->push_back(monitor);
+  return TRUE;
+}
+
+// Every monitor's area in the window's client coordinates, with its scale.
+std::vector<MonitorArea> MonitorAreasFor(HWND window) {
+  std::vector<HMONITOR> monitors;
+  EnumDisplayMonitors(nullptr, nullptr, CollectMonitor,
+                      reinterpret_cast<LPARAM>(&monitors));
+  std::vector<MonitorArea> areas;
+  for (HMONITOR monitor : monitors) {
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) continue;
+    bool physical = false;
+    MonitorArea area;
+    area.scale = MonitorScale(monitor, info, &physical);
+    area.rect = info.rcMonitor;
+    MapWindowPoints(HWND_DESKTOP, window, reinterpret_cast<POINT*>(&area.rect),
+                    2);
+    Wh_Log(L"Monitor %s: %ldx%ld, scale %.2f from its %s", info.szDevice,
+           info.rcMonitor.right - info.rcMonitor.left,
+           info.rcMonitor.bottom - info.rcMonitor.top, area.scale,
+           physical ? L"physical size" : L"display scale");
+    areas.push_back(area);
+  }
+  return areas;
 }
 
 bool IsOnBattery() {
@@ -2422,6 +2678,8 @@ class DesktopWallpaper {
   SIZE HostSize() const;
   float DpiScale() const;
   RECT CounterArea() const;
+  // Measures the monitors again when their layout changed, or when forced.
+  void UpdateMonitors(bool force);
   void ApplyFrameLimit();
   void ApplyFeedContent();
 
@@ -2444,6 +2702,9 @@ class DesktopWallpaper {
   std::unique_ptr<FeedFetcher> feed_fetcher_;
   // Kept for renderers recreated after a lost device.
   FeedContent feed_content_;
+  // Monitor rectangles on screen, to notice layout changes cheaply.
+  std::vector<RECT> monitor_rects_;
+  std::vector<MonitorArea> monitor_areas_;
 };
 
 DesktopWallpaper::~DesktopWallpaper() {
@@ -2508,6 +2769,7 @@ bool DesktopWallpaper::Create(HWND host) {
   width_ = size.cx;
   height_ = size.cy;
   dpi_scale_ = DpiScale();
+  UpdateMonitors(true);
   SetWindowPos(window_, HWND_BOTTOM, 0, 0, 0, 0,
                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
   session_registered_ =
@@ -2627,6 +2889,7 @@ bool DesktopWallpaper::CreateRenderer() {
   }
   renderer_ = std::move(renderer);
   renderer_->SetCounterArea(CounterArea());
+  renderer_->SetMonitors(monitor_areas_, NowMs());
   ApplyFrameLimit();
   if (!feed_content_.titles.empty() || !feed_content_.errors.empty()) {
     renderer_->SetFeedContent(feed_content_);
@@ -2717,6 +2980,7 @@ void DesktopWallpaper::CheckHost() {
       renderer_.reset();
     }
   }
+  UpdateMonitors(resized);
   // The taskbar can move or resize the work area, and monitors can change
   // their refresh rate, at any time.
   if (renderer_) renderer_->SetCounterArea(CounterArea());
@@ -2775,6 +3039,32 @@ RECT DesktopWallpaper::CounterArea() const {
                     2);
   }
   return area;
+}
+
+void DesktopWallpaper::UpdateMonitors(bool force) {
+  std::vector<HMONITOR> monitors;
+  EnumDisplayMonitors(nullptr, nullptr, CollectMonitor,
+                      reinterpret_cast<LPARAM>(&monitors));
+  std::vector<RECT> rects;
+  for (HMONITOR monitor : monitors) {
+    MONITORINFO info = {};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoW(monitor, &info)) rects.push_back(info.rcMonitor);
+  }
+  const bool changed =
+      rects.size() != monitor_rects_.size() ||
+      !std::equal(rects.begin(), rects.end(), monitor_rects_.begin(),
+                  [](const RECT& a, const RECT& b) {
+                    return EqualRect(&a, &b);
+                  });
+  if (!force && !changed) return;
+  monitor_rects_ = rects;
+  // Reading the EDIDs is slower, so it only happens on changes.
+  monitor_areas_ = MonitorAreasFor(window_);
+  if (renderer_ && !renderer_->SetMonitors(monitor_areas_, NowMs())) {
+    renderer_.reset();
+  }
+  if (!paused_) ScheduleFrame(0.0);
 }
 
 DWORD WINAPI RenderThreadProc(void*) {

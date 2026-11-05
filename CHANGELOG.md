@@ -5,6 +5,14 @@ All notable changes to this mod are documented in this file. Entries follow
 versions follow [Semantic Versioning](https://semver.org/) with the project
 rule from [AGENTS.md](AGENTS.md): breaking changes bump MINOR, never MAJOR.
 
+## [0.8.1] - 2026-11-05
+
+### Bug Fixes
+
+- size: give characters the same physical size on every monitor, from the
+  size each monitor reports in its EDID, or its display scale when it reports
+  none. Each monitor runs its own columns, clipped to the monitor
+
 ## [0.8.0] - 2026-11-05
 
 ### Features
