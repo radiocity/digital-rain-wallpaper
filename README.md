@@ -7,6 +7,8 @@ Falling Latin and Japanese characters are drawn with Direct3D 11 into a window
 behind the desktop icons. Icons, right-click menus and drag and drop keep
 working. One animation spans all monitors.
 
+![Digital rain falling on a black background in three layers, with a blurred back layer and blinking white characters](previews/digital-rain.gif)
+
 ## Features
 
 - Three rain layers with different sizes, speeds, opacities and blur, plus a
